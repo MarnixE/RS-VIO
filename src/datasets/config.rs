@@ -67,6 +67,42 @@ pub struct OptimizationConfig {
     pub pnp_max_iterations: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImuConfig {
+    #[serde(rename = "sensor_type")]
+    pub sensor_type: Option<String>,
+    #[serde(rename = "rate_hz")]
+    pub rate_hz: Option<f64>,
+    #[serde(rename = "T_BS")]
+    pub T_BS: Vec<f64>,
+    #[serde(rename = "accel_noise_density")]
+    pub accel_noise_density: f64,
+    #[serde(rename = "gyro_noise_density")]
+    pub gyro_noise_density: f64,
+    #[serde(rename = "accel_random_walk")]
+    pub accel_random_walk: f64,
+    #[serde(rename = "gyro_random_walk")]
+    pub gyro_random_walk: f64,
+}
+
+impl ImuConfig {
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        // Strip YAML directive if present (e.g., %YAML:1.0)
+        let content = if content.trim_start().starts_with("%YAML") {
+            content
+                .lines()
+                .skip_while(|line| line.trim_start().starts_with("%"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            content
+        };
+        let config: ImuConfig = serde_yaml::from_str(&content)?;
+        Ok(config)
+    }
+}
+
 
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {

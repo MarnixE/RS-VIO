@@ -581,3 +581,28 @@ impl Factor for PnPFactor {
         2 // 2D residual (u, v)
     }
 }
+
+
+
+#[derive(Debug, Clone)]
+pub struct IMUFactor {
+    /// Preintegrated IMU measurement: (delta position, delta velocity, delta orientation)
+    pub delta_p: Vector3<f64>,
+    pub delta_v: Vector3<f64>,
+    pub delta_q: UnitQuaternion<f64>,
+}
+
+impl Factor for IMUFactor {
+    fn linearize(
+        &self,
+        params: &[DVector<f64>],
+        compute_jacobian: bool,
+    ) -> (DVector<f64>, Option<DMatrix<f64>>) {
+        // TODO implement IMU factor linearization
+        unimplemented!()
+    }
+
+    fn get_dimension(&self) -> usize {
+        10 // 3 for delta position, 3 for delta velocity, 4 for delta orientation (quaternion)
+    }
+}

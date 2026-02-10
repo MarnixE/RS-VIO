@@ -4,6 +4,7 @@ pub mod estimator;
 pub mod feature_tracker;
 pub mod optimization;
 pub mod types; 
+pub mod imu;
 
 // Re-export commonly used types for convenience
 pub use datasets::config::Config;

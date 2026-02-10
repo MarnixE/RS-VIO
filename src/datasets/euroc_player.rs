@@ -5,9 +5,10 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 use image::{ImageReader};
+use crate::imu;
 use crate::viewers::{Viewer, create_viewer};
 use crate::estimator::Estimator;
-use crate::datasets::{config::Config, ImageData, ImuData, FrameContext, PlayerConfig, PlayerResult};
+use crate::datasets::{config::Config, ImageData, ImuData, FrameContext, PlayerConfig, PlayerResult, config::ImuConfig};
 
 
 pub struct EurocPlayer;
@@ -31,6 +32,19 @@ impl EurocPlayer {
             }
             Err(e) => {
                 result.error_message = format!("Failed to load image timestamps: {}", e);
+                return result;
+            }
+        };
+
+        let (imu_data, imu_config) = match Self::load_imu_data(
+            &config.dataset_path,
+            &image_data,
+            0, // start_frame_idx
+            image_data.len() - 1, // end_frame_idx
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                result.error_message = format!("Failed to load IMU data: {}", e);
                 return result;
             }
         };
@@ -104,6 +118,7 @@ impl EurocPlayer {
                     &mut estimator,
                     &mut context,
                     &image_data,
+                    &imu_data,
                     &config.dataset_path,
                 ) {
                     Ok(time) => time,
@@ -237,14 +252,126 @@ impl EurocPlayer {
     }
 
     fn load_imu_data(
-        _dataset_path: &str,
-        _image_data: &[ImageData],
-        _start_frame_idx: usize,
-        _end_frame_idx: usize,
-    ) -> Result<()> {
-        // TODO: Implement IMU data loading
-        log::info!("[EurocPlayer] IMU data loading (placeholder)");
-        Ok(())
+        dataset_path: &str,
+        image_data: &[ImageData],
+        start_frame_idx: usize,
+        end_frame_idx: usize,
+    ) -> Result<(Vec<ImuData>, ImuConfig), std::io::Error> {
+        // Validate frame indices
+        if image_data.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "image_data is empty"));
+        }
+        if start_frame_idx > end_frame_idx {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid frame range: start_frame_idx ({}) > end_frame_idx ({})",
+                    start_frame_idx, end_frame_idx
+                ),
+            ));
+        }
+        if end_frame_idx >= image_data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "end_frame_idx ({}) exceeds image_data length ({})",
+                    end_frame_idx, image_data.len()
+                ),
+            ));
+        }
+
+        // Extract temporal bounds from image timestamps
+        let start_timestamp = image_data[start_frame_idx].timestamp;
+        let end_timestamp = image_data[end_frame_idx].timestamp;
+
+        // Construct path to IMU CSV file
+        let imu_csv_path = Path::new(dataset_path).join("mav0").join("imu0").join("data.csv");
+        let sensor_yaml_path = Path::new(dataset_path).join("mav0").join("imu0").join("sensor.yaml");
+
+        let imu_config = match ImuConfig::load(sensor_yaml_path.to_str().unwrap()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to load IMU sensor config: {}", e),
+                ))?;
+            }
+        };
+        log::info!(
+            "[EurocPlayer] Loading IMU data from {:?} with temporal filter [{}, {}]",
+            imu_csv_path,
+            start_timestamp,
+            end_timestamp
+        );
+
+        // Open file with descriptive error
+        let file = File::open(&imu_csv_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to open IMU CSV at {:?}: {}", imu_csv_path, e)))?;
+        
+        let reader = BufReader::new(file);
+        
+        // Pre-allocate with estimated capacity (200 Hz IMU × duration in seconds)
+        // let duration_ns = (end_timestamp - start_timestamp).max(0) as u64;
+        // let duration_s = duration_ns as f64 / 1e9;
+        // let estimated_count = (duration_s * 200.0).ceil() as usize;
+        // let mut imu_measurements = Vec::with_capacity(estimated_count);
+        let mut imu_measurements = Vec::new(); // Start with empty and let it grow as needed
+        
+        // Stream and parse CSV line-by-line
+        for (line_num, line) in reader.lines().enumerate() {
+            let line = line?;
+            
+            // Skip header and empty lines
+            if line_num == 0 || line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() != 7 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Line {} has {} columns, expected 7 (timestamp,gx,gy,gz,ax,ay,az)",
+                        line_num + 1, parts.len()
+                    )
+                ));
+            }
+            
+            // Parse timestamp first for early filtering
+            let timestamp_str = parts[0].trim();
+            if let Ok(timestamp) = timestamp_str.parse::<i64>() {
+                // Apply temporal filter: [start_timestamp, end_timestamp]
+                if timestamp < start_timestamp {
+                    continue;  // Skip measurements before window
+                }
+                if timestamp > end_timestamp {
+                    break;  // EuRoC CSV is sorted; no more relevant data
+                }
+                
+                // Parse gyroscope and accelerometer data
+                if let (Ok(gyro_x), Ok(gyro_y), Ok(gyro_z),
+                        Ok(accel_x), Ok(accel_y), Ok(accel_z)) = (
+                    parts[1].trim().parse::<f64>(),
+                    parts[2].trim().parse::<f64>(),
+                    parts[3].trim().parse::<f64>(),
+                    parts[4].trim().parse::<f64>(),
+                    parts[5].trim().parse::<f64>(),
+                    parts[6].trim().parse::<f64>(),
+                ) {
+                    imu_measurements.push(ImuData {
+                        timestamp,
+                        gyro: [gyro_x, gyro_y, gyro_z],
+                        accel: [accel_x, accel_y, accel_z],
+                    });
+                }
+            }
+        }
+        
+        // Return sorted vector (already sorted due to CSV ordering and sequential read)
+        Ok((imu_measurements, imu_config))
+        // // TODO: Implement IMU data loading
+        // log::info!("[EurocPlayer] IMU data loading (placeholder)");
+        // Ok(())
     }
 
     /// Create camera models from config using the datasets module helper function
@@ -264,6 +391,7 @@ impl EurocPlayer {
         estimator: &mut Estimator<'a>,
         context: &mut FrameContext,
         image_data: &[ImageData],
+        imu_data: &[ImuData],
         dataset_path: &str,
     ) -> Result<f64> {
         let frame_start = Instant::now();
@@ -280,8 +408,9 @@ impl EurocPlayer {
         }
         
         // Get IMU data if VIO mode
-        let imu_data = if false && context.processed_frames > 0 { // TODO when implementing IMU data loading
+        let imu_result = if context.processed_frames > 0 { // TODO when implementing IMU data loading
             Some(Self::get_imu_data_between_frames(
+                imu_data,
                 context.previous_frame_timestamp,
                 image_data[context.current_idx].timestamp,
             ))
@@ -290,13 +419,21 @@ impl EurocPlayer {
         };
 
         // Process frame
-        let imu_slice = imu_data.as_ref().map(|v| v.as_slice());
+        let imu_slice = imu_result.as_ref().map(|v| v.as_slice());
+        print!("IMU slice for frame {}: ", context.current_idx);
+        if let Some(slice) = imu_slice {
+            println!("{:?}", slice);
+        } else {
+            println!("None");
+        }
         estimator.process_frame(
             &left_image,
             &right_image,
             image_data[context.current_idx].timestamp,
             imu_slice,
         )?;
+
+        println!("Processed IMU measurements: {}", imu_slice.map_or(0, |v| v.len()));
 
         // Update frame timestamp
         context.previous_frame_timestamp = image_data[context.current_idx].timestamp;
@@ -306,11 +443,34 @@ impl EurocPlayer {
     }
 
     fn get_imu_data_between_frames(
-        _previous_timestamp: i64,
-        _current_timestamp: i64,
+        imu_data: &[ImuData],
+        previous_timestamp: i64,
+        current_timestamp: i64,
     ) -> Vec<ImuData> {
-        // TODO: Implement IMU data retrieval between timestamps
-        Vec::new()
+        // Handle edge cases
+        if imu_data.is_empty() || previous_timestamp >= current_timestamp {
+            return Vec::new();
+        }
+        
+        // Binary search for first measurement with timestamp > previous_timestamp
+        let start_idx = imu_data.partition_point(|imu| imu.timestamp <= previous_timestamp);
+        
+        // If start_idx is beyond the array, no measurements exist after previous_timestamp
+        if start_idx >= imu_data.len() {
+            return Vec::new();
+        }
+        
+        // Find first measurement with timestamp > current_timestamp
+        let end_idx = imu_data[start_idx..].partition_point(|imu| imu.timestamp <= current_timestamp);
+        let end_idx = start_idx + end_idx;
+        
+        // Clone the subset of measurements in the half-open interval (previous, current]
+        // Note: We clone because the caller needs owned data for IMU pre-integration
+        imu_data[start_idx..end_idx].iter().map(|imu| ImuData {
+            timestamp: imu.timestamp,
+            gyro: imu.gyro,
+            accel: imu.accel,
+        }).collect()
     }
 
     fn save_trajectories(
