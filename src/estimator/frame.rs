@@ -1,7 +1,9 @@
 use crate::datasets::ImuData;
 use crate::estimator::state::State;
 use crate::feature_tracker::Feature;
-use crate::types::Matrix4x4;
+use crate::imu;
+use crate::imu::piecewise_integration::PreInt;
+use crate::types::{Matrix4x4, Vector3};
 use nalgebra as na;
 use nalgebra034;
 use std::collections::HashMap;
@@ -35,6 +37,8 @@ pub struct Frame {
 
     /// IMU samples since last keyframe.
     pub imu_since_last_keyframe: Vec<ImuData>,
+
+    pub imu_preintegration: Option<PreInt>,
 
     /// Whether this frame is a keyframe.
     pub is_keyframe: bool,
@@ -71,6 +75,7 @@ impl Frame {
             is_keyframe: false,
             left_features: Vec::new(),
             right_features: Vec::new(),
+            imu_preintegration: None,
         }
     }
 
@@ -82,6 +87,11 @@ impl Frame {
         right_cam: CameraModelType,
         T_B_Cl: Matrix4x4,
         T_B_Cr: Matrix4x4,
+        T_B_W: Option<Matrix4x4>,
+        velocity: Option<Vector3>,
+        accel_bias: Option<Vector3>,
+        gyro_bias: Option<Vector3>,
+        angular_velocity: Option<Vector3>,
     ) -> Self {
         Self {
             timestamp_ns,
@@ -89,13 +99,24 @@ impl Frame {
             frame_type: FrameType::Stereo,
             left_cam,
             right_cam,
-            state: State::new(T_B_Cl, T_B_Cr),
+            state: State::new(T_B_Cl, T_B_Cr, T_B_W, velocity, accel_bias, gyro_bias, angular_velocity),
             imu_from_last_frame: Vec::new(),
             imu_since_last_keyframe: Vec::new(),
             is_keyframe: true,
             left_features: Vec::new(),
             right_features: Vec::new(),
+            imu_preintegration: None,
         }
+    }
+
+    pub fn add_imu_data(&mut self, imu_data: ImuData) {
+        let un_gyr = 0.5 * (imu_data.gyro + self.state.gyro_bias);
+        // self.state.T_W_B = 
+
+
+        self.imu_from_last_frame.push(imu_data.clone());
+        self.imu_since_last_keyframe.push(imu_data);
+        
     }
 
     /// Immutable access to left-image features.
@@ -131,6 +152,11 @@ impl Frame {
         let undist_coord = self.right_cam.as_camera_model().unproject_one(&nalgebra034::Vector2::new(feature.pixel_coord[0] as f64, feature.pixel_coord[1] as f64));
         feature.undistorted_coord = [undist_coord[0] as f32, undist_coord[1] as f32];
         self.right_features.push(feature);
+    }
+
+    pub fn add_imu(&mut self, imu_preint: PreInt) {
+        self.imu_preintegration = Some(imu_preint);
+
     }
 }
 

@@ -1,13 +1,18 @@
 #[cfg(test)]
 mod tests {
+    use crate::optimization::factors::ImuFactor;
     use crate::optimization::observer::TerminalObserver;
     use crate::optimization::factors::PinholeProjectionFactor;
     use crate::optimization::factors::BundleAdjustmentFactorTranslationOnly;
     use crate::optimization::factors::BundleAdjustmentFactor;
+    use apex_solver::Factor;
+    use apex_solver::manifold::Tangent;
+    use apex_solver::manifold::so3;
     use apex_solver::optimizer::levenberg_marquardt::{LevenbergMarquardt, LevenbergMarquardtConfig};
     use apex_solver::linalg::LinearSolverType;
     use apex_solver::manifold::ManifoldType;
     use apex_solver::core::problem::Problem;
+    use rand::random;
     use std::collections::HashMap;
     use nalgebra as na;
     use na::DVector;
@@ -456,7 +461,8 @@ mod tests {
             T_C_B: na::Matrix4<f64>,  // T_C_B: SE3 transform from B to C
             fixed_pose: Option<na::Matrix4<f64>>,
         ) {
-            let mut factor = BundleAdjustmentFactor::new(observation, T_C_B);
+            // let sqrt_info = na::Matrix2::identity(); // Assuming unit covariance for simplicity
+            let mut factor = BundleAdjustmentFactor::new(observation, T_C_B, None);
             if let Some(pose) = fixed_pose {
                 factor = factor.with_fixed_pose(pose);
             }
@@ -679,5 +685,902 @@ mod tests {
         }
 
     }
+
+    use approx::{assert_abs_diff_eq, assert_relative_eq};
+    use nalgebra::{DMatrix, Matrix3, Vector3, UnitQuaternion};
+    use crate::imu::piecewise_integration::PreInt;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    // ---- Helpers: build parameter blocks in the format your Factor expects ----
+    fn pose7(t: Vector3<f64>, q_wxyz: [f64; 4]) -> DVector<f64> {
+        // (tx,ty,tz,qw,qx,qy,qz)
+        DVector::from_vec(vec![t.x, t.y, t.z, q_wxyz[0], q_wxyz[1], q_wxyz[2], q_wxyz[3]])
+    }
+
+    fn speedbias9(v: Vector3<f64>, ba: Vector3<f64>, bg: Vector3<f64>) -> DVector<f64> {
+        // (vx,vy,vz,bax,bay,baz,bgx,bgy,bgz)
+        DVector::from_vec(vec![
+            v.x, v.y, v.z,
+            ba.x, ba.y, ba.z,
+            bg.x, bg.y, bg.z
+        ])
+    }
+
+    fn quat_from_wxyz(q: [f64; 4]) -> UnitQuaternion<f64> {
+        // nalgebra uses (w, i, j, k)
+        UnitQuaternion::from_quaternion(na::Quaternion::new(q[0], q[1], q[2], q[3]))
+    }
+
+    fn quat_to_wxyz(q: &UnitQuaternion<f64>) -> [f64; 4] {
+        let qq = q.quaternion();
+        [qq.w, qq.i, qq.j, qq.k]
+    }
+
+     // ---- Define the 30D local perturbation mapping used by the Jacobian columns ----
+    //
+    // Columns [0..30) interpreted as:
+    //  0..3   : dphi_i
+    //  3..6   : dp_i   (applied as p_i <- p_i + R_i * dp_i; body-frame translation perturbation)
+    //  6..9   : dv_i
+    //  9..12  : dphi_j
+    //  12..15 : dp_j   (p_j <- p_j + R_j * dp_j)
+    //  15..18 : dv_j
+    //  18..21 : dbg_i
+    //  21..24 : dba_i
+    //  24..27 : dba_j
+    //  27..30 : dbg_j
+    //
+    // This matches the way your Jacobian blocks are *used* in the dv/dp rows (bg at col 18, ba at col 21),
+    // and it makes bias-residual rows easy to validate.
+    fn apply_local_update_30(
+        params: &Vec<na::DVector<f64>>,
+        dx: &na::SVector<f64, 30>,
+    ) -> Vec<na::DVector<f64>> {
+        assert_eq!(params.len(), 4);
+        assert_eq!(params[0].len(), 7);
+        assert_eq!(params[1].len(), 9);
+        assert_eq!(params[2].len(), 7);
+        assert_eq!(params[3].len(), 9);
+
+        // New column layout (must match ImuFactor::linearize() fill order):
+        // i: dphi(0..3), dv(3..6), dp(6..9), dba(9..12), dbg(12..15)
+        // j: dphi(15..18), dv(18..21), dp(21..24), dba(24..27), dbg(27..30)
+        const PHI_I: usize = 0;
+        const V_I: usize   = 3;
+        const P_I: usize   = 6;
+        const BA_I: usize  = 9;
+        const BG_I: usize  = 12;
+
+        const PHI_J: usize = 15;
+        const V_J: usize   = 18;
+        const P_J: usize   = 21;
+        const BA_J: usize  = 24;
+        const BG_J: usize  = 27;
+
+        let mut out = params.clone();
+
+        // --- Pose update: [t(3), q(wxyz)(4)] with right perturbation ---
+        // R <- R * Exp(dphi)
+        // p <- p + R * dp   (dp is body-frame tangent translation)
+        let mut update_pose7_inplace = |pose7v: &mut na::DVector<f64>, dphi: na::Vector3<f64>, dp: na::Vector3<f64>| {
+            let t = na::Vector3::new(pose7v[0], pose7v[1], pose7v[2]);
+
+            let qw = pose7v[3];
+            let qx = pose7v[4];
+            let qy = pose7v[5];
+            let qz = pose7v[6];
+            let q = UnitQuaternion::from_quaternion(na::Quaternion::new(qw, qx, qy, qz));
+
+            // --- CHANGE START: dq from your so3::SO3::exp ---
+            let dR_tangent = so3::SO3Tangent::from_components(dphi[0], dphi[1], dphi[2]);
+            let dR= dR_tangent.exp(None);
+
+            // Convert SO3 -> Matrix3 (you must adapt this one method name to your SO3 API)
+            let Rm: na::Matrix3<f64> = dR.rotation_matrix(); // e.g. dR.matrix(), dR.as_matrix(), dR.rotmat(), etc.
+
+            // Matrix3 -> Rotation3 -> UnitQuaternion
+            let rot = na::Rotation3::from_matrix_unchecked(Rm);
+            let dq = UnitQuaternion::from_rotation_matrix(&rot);
+            // --- CHANGE END ---
+
+            // Right perturbation (keep consistent with your analytic convention)
+            let q_new = q * dq;
+
+            let R = q.to_rotation_matrix();
+            let t_new = t + R * dp;
+
+            let qq = q_new.quaternion();
+            pose7v[0] = t_new.x;
+            pose7v[1] = t_new.y;
+            pose7v[2] = t_new.z;
+            pose7v[3] = qq.w;
+            pose7v[4] = qq.i;
+            pose7v[5] = qq.j;
+            pose7v[6] = qq.k;
+        };
+
+
+        // pose i
+        update_pose7_inplace(
+            &mut out[0],
+            na::Vector3::new(dx[PHI_I], dx[PHI_I + 1], dx[PHI_I + 2]),
+            na::Vector3::new(dx[P_I],   dx[P_I   + 1], dx[P_I   + 2]),
+        );
+
+        // speedbias i: [v(3), ba(3), bg(3)] additive
+        out[1][0] += dx[V_I];     out[1][1] += dx[V_I + 1];     out[1][2] += dx[V_I + 2];
+        out[1][3] += dx[BA_I];    out[1][4] += dx[BA_I + 1];    out[1][5] += dx[BA_I + 2];
+        out[1][6] += dx[BG_I];    out[1][7] += dx[BG_I + 1];    out[1][8] += dx[BG_I + 2];
+
+        // pose j
+        update_pose7_inplace(
+            &mut out[2],
+            na::Vector3::new(dx[PHI_J], dx[PHI_J + 1], dx[PHI_J + 2]),
+            na::Vector3::new(dx[P_J],   dx[P_J   + 1], dx[P_J   + 2]),
+        );
+
+        // speedbias j: [v(3), ba(3), bg(3)] additive
+        out[3][0] += dx[V_J];     out[3][1] += dx[V_J + 1];     out[3][2] += dx[V_J + 2];
+        out[3][3] += dx[BA_J];    out[3][4] += dx[BA_J + 1];    out[3][5] += dx[BA_J + 2];
+        out[3][6] += dx[BG_J];    out[3][7] += dx[BG_J + 1];    out[3][8] += dx[BG_J + 2];
+
+        out
+    }
+
+
+    #[test]
+    fn imu_factor_residual_zero_when_preint_matches_state() {
+        let dt = 0.01;
+        let g = Vector3::new(0.0, 0.0, 9.81007);
+
+        // Choose a simple state.
+        let qi = UnitQuaternion::identity();
+        let ri = qi.to_rotation_matrix();
+        let ti = Vector3::new(1.0, 2.0, 3.0);
+        let vi = Vector3::new(0.5, -0.2, 0.1);
+
+        // Keep biases constant and equal across i->j.
+        let bai = Vector3::new(0.01, -0.02, 0.03);
+        let bgi = Vector3::new(-0.001, 0.002, -0.003);
+        let baj = bai;
+        let bgj = bgi;
+
+        // Define j consistent with a "perfect" preintegrated measurement:
+        // residual_dv = Ri^T*(v_j - v_i + g*dt) - dv = 0  => dv = Ri^T*(...)
+        // residual_dp = Ri^T*(t_j - t_i - v_i*dt + 0.5*g*dt^2) - dp = 0 => dp = Ri^T*(...)
+        let vj = vi - g * dt; // so vj - vi + g*dt = 0 => dv must be 0
+        let tj = ti + vi * dt - 0.5 * g * dt * dt; // so translation residual is 0 with dp=0
+
+        // For rotation, choose Rj = Ri * dR, and set preint.dR = Ri^{-1}Rj.
+        let qj = qi;
+        let dR = so3::SO3::identity(); // must match your implementation
+
+        let preint = PreInt::new(
+            dR,
+            Vector3::zeros(),
+            Vector3::zeros(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            dt,
+            Vector3::zeros(),
+            Vector3::zeros(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            &Vec::new(),
+            g,
+        );
+
+        let factor = ImuFactor::new(preint, bai, bgi);
+
+        let params = vec![
+            pose7(ti, quat_to_wxyz(&qi)),
+            speedbias9(vi, bai, bgi),
+            pose7(tj, quat_to_wxyz(&qj)),
+            speedbias9(vj, baj, bgj),
+        ];
+
+        let (r, j) = factor.linearize(&params, true);
+        assert_eq!(r.len(), 15);
+        assert!(j.is_some());
+
+        // Residual should be ~0 (numerical eps).
+        for k in 0..15 {
+            print!("r[{}] = {:.6e}  ", k, r[k]);
+            assert_abs_diff_eq!(r[k], 0.0, epsilon = 1e-10);
+        }
+    }
+
+    fn make_preint(dt: f64, g: Vector3<f64>, delta_r: so3::SO3, delta_v: Vector3<f64>, delta_p: Vector3<f64>) -> PreInt {
+        PreInt::new(
+            delta_r,
+            delta_v,
+            delta_p,
+            na::SMatrix::<f64, 15, 15>::identity(), // cov (fixture)
+            dt,
+            na::Vector3::zeros(),                   // (your fields; keep as in your existing tests)
+            na::Vector3::zeros(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            &Vec::new(),
+            g,
+        )
+    }
+
+    /// Build a *consistent* state pair (i,j) for given deltas with dt>0:
+    /// v_j = v_i + g*dt + R_i*delta_v
+    /// p_j = p_i + v_i*dt + 0.5*g*dt^2 + R_i*delta_p
+    fn make_consistent_params_dt(
+        dt: f64,
+        g: Vector3<f64>,
+        t_i: Vector3<f64>,
+        v_i: Vector3<f64>,
+        q_i: UnitQuaternion<f64>,
+        delta_r_phi: Vector3<f64>,
+        delta_v_i: Vector3<f64>,
+        delta_p_i: Vector3<f64>,
+        ba_i: Vector3<f64>,
+        bg_i: Vector3<f64>,
+    ) -> (Vec<na::DVector<f64>>, UnitQuaternion<f64>, Vector3<f64>, Vector3<f64>) {
+        let q_j = q_i * UnitQuaternion::from_scaled_axis(delta_r_phi);
+        let r_i = q_i.to_rotation_matrix().into_inner();
+
+        let v_j = v_i - g * dt + r_i * delta_v_i;
+        let t_j = t_i + v_i * dt - 0.5 * g * (dt * dt) + r_i * delta_p_i;
+
+        let params = vec![
+            pose7(t_i, quat_to_wxyz(&q_i)),
+            speedbias9(v_i, ba_i, bg_i),
+            pose7(t_j, quat_to_wxyz(&q_j)),
+            speedbias9(v_j, ba_i, bg_i), // keep biases equal so bias residual is ~0
+        ];
+
+        (params, q_j, v_j, t_j)
+    }
+
+    #[test]
+    fn imu_factor_dt_fixture_rotation_residual_isolated() {
+        let dt = 0.05;
+        let g = Vector3::new(0.0, 0.0, 9.81007);
+
+        let t_i = Vector3::new(1.0, -2.0, 0.5);
+        let v_i = Vector3::new(0.3, -0.1, 0.2);
+
+        let ba = Vector3::new(0.01, -0.02, 0.03);
+        let bg = Vector3::new(-0.001, 0.002, -0.003);
+
+        let q_i = UnitQuaternion::from_scaled_axis(Vector3::new(0.2, -0.1, 0.05));
+        let dphi = Vector3::new(0.03, -0.02, 0.01);
+        let delta_r = so3::SO3::from_scaled_axis(dphi);
+
+        // Nonzero deltas to activate cross-terms
+        let delta_v = Vector3::new(0.2, -0.1, 0.05);
+        let delta_p = Vector3::new(0.15, -0.05, 0.08);
+
+        let (params, _q_j, _v_j, _t_j) = make_consistent_params_dt(dt, g, t_i, v_i, q_i, dphi, delta_v, delta_p, ba, bg);
+
+        let preint_ok = make_preint(dt, g, delta_r, delta_v, delta_p);
+        let factor_ok = ImuFactor::new(preint_ok, ba, bg);
+
+        let (r_ok, _) = factor_ok.linearize(&params, false);
+        // print!("Rotation residuals (should be near zero): {:?}", r_ok);
+        assert!(r_ok.norm() < 1e-10, "consistent dt>0 fixture should yield near-zero residual");
+
+        // Break only delta_R
+        let preint_bad = make_preint(dt, g, so3::SO3::identity(), delta_v, delta_p);
+        let factor_bad = ImuFactor::new(preint_bad, ba, bg);
+
+        let (r_bad, _) = factor_bad.linearize(&params, false);
+        let r_rot = r_bad.rows(0, 3).norm();
+        let r_rest = r_bad.rows(3, 12).norm();
+        assert!(r_rot > 1e-6);
+        assert!(r_rest < 1e-10);
+
+        // Jacobian check
+        let eps = 1e-7;
+        let use_local = true; // set to what your plus() / perturbation actually uses
+        let (r_lin, j_opt) = factor_bad.linearize(&params, true);
+        let j = j_opt.expect("jacobian must be returned");
+        let j_num = central_diff_jacobian(&factor_bad, &params, eps, use_local);
+        let diff = (&j - &j_num).amax();
+        print!("Rotation diff: {:?}", (&j - &j_num));
+        assert!(diff < 5e-5, "rotation fixture jacobian mismatch: {}", diff);
+    }
+
+    #[test]
+    fn imu_factor_dt_fixture_velocity_residual_isolated() {
+        let dt = 0.05;
+        let g = Vector3::new(0.0, 0.0, 9.81007);
+
+        let t_i = Vector3::new(-0.3, 0.8, 1.5);
+        let v_i = Vector3::new(0.6, -0.2, 0.1);
+
+        let ba = Vector3::new(0.01, -0.02, 0.03);
+        let bg = Vector3::new(-0.001, 0.002, -0.003);
+
+        let q_i = UnitQuaternion::from_scaled_axis(Vector3::new(-0.15, 0.07, 0.03));
+        let dphi = Vector3::new(0.02, 0.01, -0.015);
+        let delta_r = so3::SO3::from_scaled_axis(dphi);
+
+        let delta_v = Vector3::new(0.25, 0.05, -0.12);
+        let delta_p = Vector3::new(-0.04, 0.11, 0.09);
+
+        let (params, _q_j, _v_j, _t_j) = make_consistent_params_dt(dt, g, t_i, v_i, q_i, dphi, delta_v, delta_p, ba, bg);
+
+        let preint_ok = make_preint(dt, g, delta_r.clone(), delta_v, delta_p);
+        let factor_ok = ImuFactor::new(preint_ok, ba, bg);
+        let (r_ok, _) = factor_ok.linearize(&params, false);
+        assert!(r_ok.norm() < 1e-10);
+
+        // Break only delta_v
+        let preint_bad = make_preint(dt, g, delta_r, na::Vector3::zeros(), delta_p);
+        let factor_bad = ImuFactor::new(preint_bad, ba, bg);
+
+        let (r_bad, _) = factor_bad.linearize(&params, false);
+        let r_vel = r_bad.rows(3, 3).norm();
+        let r_other = (r_bad.rows(0, 3).norm().powi(2) + r_bad.rows(6, 9).norm().powi(2)).sqrt();
+        assert!(r_vel > 1e-6);
+        assert!(r_other < 1e-10);
+
+        let eps = 1e-7;
+        let use_local = true;
+        let (_, j_opt) = factor_bad.linearize(&params, true);
+        let j = j_opt.unwrap();
+        let j_num = central_diff_jacobian(&factor_bad, &params, eps, use_local);
+        let diff = (&j - &j_num).amax();
+        assert!(diff < 5e-5, "velocity fixture jacobian mismatch: {}", diff);
+    }
+
+    #[test]
+    fn imu_factor_dt_fixture_position_residual_isolated() {
+        let dt = 0.05;
+        let g = Vector3::new(0.0, 0.0, 9.81007);
+
+        let t_i = Vector3::new(2.0, -1.0, 0.3);
+        let v_i = Vector3::new(-0.1, 0.4, 0.2);
+
+        let ba = Vector3::new(0.01, -0.02, 0.03);
+        let bg = Vector3::new(-0.001, 0.002, -0.003);
+
+        let q_i = na::UnitQuaternion::from_scaled_axis(na::Vector3::new(0.09, 0.13, -0.04));
+        let dphi = na::Vector3::new(-0.01, 0.03, 0.02);
+        let delta_r = so3::SO3::from_scaled_axis(dphi);
+
+        let delta_v = na::Vector3::new(-0.08, 0.22, 0.07);
+        let delta_p = na::Vector3::new(0.3, -0.12, 0.05);
+
+        let (params, _q_j, _v_j, _t_j) = make_consistent_params_dt(dt, g, t_i, v_i, q_i, dphi, delta_v, delta_p, ba, bg);
+
+        let preint_ok = make_preint(dt, g, delta_r.clone(), delta_v, delta_p);
+        let factor_ok = ImuFactor::new(preint_ok, ba, bg);
+        let (r_ok, _) = factor_ok.linearize(&params, false);
+        assert!(r_ok.norm() < 1e-10);
+
+        // Break only delta_p
+        let preint_bad = make_preint(dt, g, delta_r, delta_v, na::Vector3::zeros());
+        let factor_bad = ImuFactor::new(preint_bad, ba, bg);
+
+        let (r_bad, _) = factor_bad.linearize(&params, false);
+        let r_pos = r_bad.rows(6, 3).norm();
+        let r_other = (r_bad.rows(0, 6).norm().powi(2) + r_bad.rows(9, 6).norm().powi(2)).sqrt();
+        assert!(r_pos > 1e-6);
+        assert!(r_other < 1e-10);
+
+        let eps = 1e-7;
+        let use_local = true;
+        let (_, j_opt) = factor_bad.linearize(&params, true);
+        let j = j_opt.unwrap();
+        let j_num = central_diff_jacobian(&factor_bad, &params, eps, use_local);
+        let diff = (&j - &j_num).amax();
+        assert!(diff < 5e-5, "position fixture jacobian mismatch: {}", diff);
+    }
+
+
+    #[test]
+    fn imu_factor_whitening_scales_residual_and_jacobian_rows() {
+        // This test checks the same behavior as VINS-Mono's `sqrt_info * residual` and `sqrt_info * jacobian` [page:0].
+        let dt = 0.1;
+
+        let preint = PreInt {
+            dt,
+            delta_R: so3::SO3::identity(),
+            delta_v: Vector3::new(1.0, 2.0, 3.0),
+            delta_p: Vector3::new(4.0, 5.0, 6.0),
+            linearized_ba: Vector3::zeros(),
+            linearized_bg: Vector3::zeros(),
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity() * 2.0, // no whitening
+            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, 9.81007),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
+        };
+
+        let bias_a = Vector3::zeros();
+        let bias_g = Vector3::zeros();
+        let factor = ImuFactor::new(preint.clone(), bias_a, bias_g);
+
+        let qi = UnitQuaternion::identity();
+        let qj = UnitQuaternion::identity();
+
+        let params = vec![
+            pose7(na::Vector3::zeros(), quat_to_wxyz(&qi)),
+            speedbias9(na::Vector3::zeros(), na::Vector3::zeros(), na::Vector3::zeros()),
+            pose7(na::Vector3::zeros(), quat_to_wxyz(&qj)),
+            speedbias9(na::Vector3::zeros(), na::Vector3::new(1.0, 0.0, 0.0), na::Vector3::new(0.0, 1.0, 0.0)),
+        ];
+
+        let (r_wh, j_wh) = factor.linearize(&params, true);
+        let j_wh = j_wh.unwrap();
+
+        // Now compute the same residual with whitening disabled (w9=1,w6=1) and compare scaling.
+        let mut preint_un = preint.clone();
+        preint_un.sqrt_info = na::SMatrix::<f64, 15, 15>::identity();
+        let factor_un = ImuFactor::new(preint_un, bias_a, bias_g);
+        let (r_un, j_un) = factor_un.linearize(&params, true);
+        let j_un = j_un.unwrap();
+
+        print!("Finite-difference column {:?}\n{:?}", r_wh, r_un);
+
+        // First 9 rows scaled by 2, last 6 rows scaled by 3.
+        for k in 0..9 {
+            assert_relative_eq!(r_wh[k], 2.0 * r_un[k], epsilon = 1e-10);
+        }
+        for k in 9..15 {
+            assert_relative_eq!(r_wh[k], 2.0 * r_un[k], epsilon = 1e-10);
+        }
+
+        // Same for Jacobian rows.
+        for row in 0..9 {
+            for col in 0..30 {
+                assert_relative_eq!(j_wh[(row, col)], 2.0 * j_un[(row, col)], epsilon = 1e-10);
+            }
+        }
+        for row in 9..15 {
+            for col in 0..30 {
+                assert_relative_eq!(j_wh[(row, col)], 2.0 * j_un[(row, col)], epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn imu_factor_jacobian_matches_finite_difference() {
+        // This is the test that will catch wrong column assignments/signs.
+        let dt = 0.02;
+        let preint = PreInt {
+            dt,
+            delta_R: so3::SO3::identity(),
+            delta_v: Vector3::new(0.1, -0.2, 0.05),
+            delta_p: Vector3::new(0.01, 0.02, -0.03),
+            linearized_bg: 0.04 * Vector3::zeros(),
+            linearized_ba: 0.05 * Vector3::zeros(),
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
+            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, 9.81007),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
+        };
+
+        let bias_a = Vector3::new(0.021, -0.011, -0.031);
+        let bias_g = Vector3::new(-0.0041, 0.0031, 0.0021);
+        let factor = ImuFactor::new(preint, bias_a, bias_g);
+
+        let qi = na::UnitQuaternion::from_scaled_axis(na::Vector3::new(0.02, -0.01, 0.03));
+        let qj = na::UnitQuaternion::from_scaled_axis(na::Vector3::new(-0.01, 0.04, 0.01));
+        let params = vec![
+            pose7(na::Vector3::new(1.0, 2.0, 3.0), quat_to_wxyz(&qi)),
+            speedbias9(
+                na::Vector3::new(0.5, -0.2, 0.1),
+                na::Vector3::new(0.02, 0.01, -0.03),
+                na::Vector3::new(-0.004, 0.003, 0.002),
+            ),
+            pose7(na::Vector3::new(1.1, 2.1, 2.9), quat_to_wxyz(&qj)),
+            speedbias9(
+                na::Vector3::new(0.45, -0.18, 0.12),
+                na::Vector3::new(0.021, 0.011, -0.031),
+                na::Vector3::new(-0.0045, 0.0032, 0.0019),
+            ),
+        ];
+
+        let (r0, j_opt) = factor.linearize(&params, true);
+        let j = j_opt.expect("jacobian must be returned");
+        assert_eq!(j.nrows(), 15);
+        assert_eq!(j.ncols(), 30);
+        assert_eq!(r0.len(), 15);
+
+        let eps = 1e-7;
+
+        for col in 0..30 {
+            let mut dxp = na::SVector::<f64, 30>::zeros();
+            dxp[col] = eps;
+            let dxm = -dxp;
+
+            let pp = apply_local_update_30(&params, &dxp);
+            let pm = apply_local_update_30(&params, &dxm);
+
+            let (rp, _) = factor.linearize(&pp, false);
+            let (rm, _) = factor.linearize(&pm, false);
+
+            let num = (rp - rm) * (0.5 / eps);
+            print!("Finite-difference column {}: {:?}\n", col, num.transpose());
+
+            // Compare column to finite-difference (allow slightly looser tolerance for rotation components).
+            for row in 0..15 {
+                let tol = if row < 3 { 5e-5 } else { 5e-6 };
+                let diff = (j[(row, col)] - num[row]).abs();
+                assert!(
+                    diff <= tol,
+                    "Mismatch at (row={}, col={}): analytic={}, numeric={}, |diff|={}, tol={}",
+                    row,
+                    col,
+                    j[(row, col)],
+                    num[row],
+                    diff,
+                    tol,
+                    // params
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn imu_factor_compute_jacobian_flag_works() {
+        let preint = PreInt {
+            dt: 0.01,
+            delta_R: so3::SO3::identity(),
+            delta_v: Vector3::zeros(),
+            delta_p: Vector3::zeros(),
+            linearized_ba: Vector3::zeros(),
+            linearized_bg: Vector3::zeros(),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
+            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, 9.81007),
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
+        };
+        let factor = ImuFactor::new(preint, Vector3::zeros(), Vector3::zeros());
+
+        let qi = na::UnitQuaternion::identity();
+        let params = vec![
+            pose7(na::Vector3::zeros(), quat_to_wxyz(&qi)),
+            speedbias9(na::Vector3::zeros(), na::Vector3::zeros(), na::Vector3::zeros()),
+            pose7(na::Vector3::zeros(), quat_to_wxyz(&qi)),
+            speedbias9(na::Vector3::zeros(), na::Vector3::zeros(), na::Vector3::zeros()),
+        ];
+
+        let (_, j_none) = factor.linearize(&params, false);
+        assert!(j_none.is_none());
+
+        let (_, j_some) = factor.linearize(&params, true);
+        assert!(j_some.is_some());
+    }
+
+    fn so3_exp_quat(dphi: Vector3<f64>) -> UnitQuaternion<f64> {
+        let theta = dphi.norm();
+        if theta < 1e-12 {
+            // small-angle: sin(theta/2) ~ theta/2
+            let half = 0.5;
+            return UnitQuaternion::from_quaternion(na::Quaternion::new(
+                1.0,
+                half * dphi.x,
+                half * dphi.y,
+                half * dphi.z,
+            ));
+        }
+        let axis = dphi / theta;
+        let half = 0.5 * theta;
+        UnitQuaternion::from_quaternion(na::Quaternion::new(
+            half.cos(),
+            axis.x * half.sin(),
+            axis.y * half.sin(),
+            axis.z * half.sin(),
+        ))
+    }
+
+    fn quat_to_params_wxyz(q: &UnitQuaternion<f64>) -> (f64, f64, f64, f64) {
+        let qq = q.quaternion();
+        (qq.w, qq.i, qq.j, qq.k)
+    }
+
+    fn pack_pose7(t: Vector3<f64>, q: UnitQuaternion<f64>) -> nalgebra::DVector<f64> {
+        let (qw, qx, qy, qz) = quat_to_params_wxyz(&q);
+        nalgebra::DVector::from_vec(vec![t.x, t.y, t.z, qw, qx, qy, qz])
+    }
+
+    fn unpack_pose7(p: &nalgebra::DVector<f64>) -> (Vector3<f64>, UnitQuaternion<f64>) {
+        let t = Vector3::new(p[0], p[1], p[2]);
+        let q = UnitQuaternion::from_quaternion(na::Quaternion::new(p[3], p[4], p[5], p[6]));
+        (t, q)
+    }
+
+    fn pack_vb9(v: Vector3<f64>, ba: Vector3<f64>, bg: Vector3<f64>) -> nalgebra::DVector<f64> {
+        nalgebra::DVector::from_vec(vec![
+            v.x, v.y, v.z,
+            ba.x, ba.y, ba.z,
+            bg.x, bg.y, bg.z
+        ])
+    }
+
+    fn unpack_vb9(p: &nalgebra::DVector<f64>) -> (Vector3<f64>, Vector3<f64>, Vector3<f64>) {
+        let v  = na::Vector3::new(p[0], p[1], p[2]);
+        let ba = na::Vector3::new(p[3], p[4], p[5]);
+        let bg = na::Vector3::new(p[6], p[7], p[8]);
+        (v, ba, bg)
+    }
+
+    // Parameter layout for your 15x30 Jacobian:
+    // [phi_i(3), v_i(3), p_i(3), ba_i(3), bg_i(3), phi_j(3), v_j(3), p_j(3), ba_j(3), bg_j(3)]
+    fn apply_delta_to_params(
+        base_params: &[nalgebra::DVector<f64>], // 4 blocks: pose_i(7), vb_i(9), pose_j(7), vb_j(9)
+        delta30: &na::SVector<f64, 30>,
+        translation_is_local: bool,
+    ) -> Vec<nalgebra::DVector<f64>> {
+        let (t_i, q_i) = unpack_pose7(&base_params[0]);
+        let (v_i, ba_i, bg_i) = unpack_vb9(&base_params[1]);
+        let (t_j, q_j) = unpack_pose7(&base_params[2]);
+        let (v_j, ba_j, bg_j) = unpack_vb9(&base_params[3]);
+
+        let dphi_i = Vector3::new(delta30[0],  delta30[1],  delta30[2]);
+        let dv_i   = Vector3::new(delta30[3],  delta30[4],  delta30[5]);
+        let dp_i   = Vector3::new(delta30[6],  delta30[7],  delta30[8]);
+        let dba_i  = Vector3::new(delta30[9],  delta30[10], delta30[11]);
+        let dbg_i  = Vector3::new(delta30[12], delta30[13], delta30[14]);
+
+        let dphi_j = Vector3::new(delta30[15], delta30[16], delta30[17]);
+        let dv_j   = Vector3::new(delta30[18], delta30[19], delta30[20]);
+        let dp_j   = Vector3::new(delta30[21], delta30[22], delta30[23]);
+        let dba_j  = Vector3::new(delta30[24], delta30[25], delta30[26]);
+        let dbg_j  = Vector3::new(delta30[27], delta30[28], delta30[29]);
+
+        // Right-multiplicative rotation update: R <- R * Exp(dphi)
+        let q_i_new = (q_i * so3_exp_quat(dphi_i));
+        let q_j_new = (q_j * so3_exp_quat(dphi_j));
+
+        let r_i: Matrix3<f64> = q_i.to_rotation_matrix().into_inner();
+        let r_j: Matrix3<f64> = q_j.to_rotation_matrix().into_inner();
+
+        // Translation update: either world-add (t <- t + dp) or local-add (t <- t + R*dp)
+        let t_i_new = if translation_is_local { t_i + r_i * dp_i } else { t_i + dp_i };
+        let t_j_new = if translation_is_local { t_j + r_j * dp_j } else { t_j + dp_j };
+
+        let v_i_new  = v_i  + dv_i;
+        let v_j_new  = v_j  + dv_j;
+        let ba_i_new = ba_i + dba_i;
+        let bg_i_new = bg_i + dbg_i;
+        let ba_j_new = ba_j + dba_j;
+        let bg_j_new = bg_j + dbg_j;
+
+        vec![
+            pack_pose7(t_i_new, q_i_new),
+            pack_vb9(v_i_new, ba_i_new, bg_i_new),
+            pack_pose7(t_j_new, q_j_new),
+            pack_vb9(v_j_new, ba_j_new, bg_j_new),
+        ]
+    }
+
+    fn central_diff_jacobian(
+        factor: &ImuFactor,
+        base_params: &[nalgebra::DVector<f64>],
+        eps: f64,
+        translation_is_local: bool,
+    ) -> nalgebra::DMatrix<f64> {
+        let (r0, _) = factor.linearize(base_params, false);
+        let m = r0.len();
+        let n = 30;
+
+        let mut j_num = nalgebra::DMatrix::<f64>::zeros(m, n);
+
+        for k in 0..n {
+            let mut d = na::SVector::<f64, 30>::zeros();
+            d[k] = eps;
+
+            let p_plus = apply_delta_to_params(base_params, &d, translation_is_local);
+            let (r_plus, _) = factor.linearize(&p_plus, false);
+
+            let mut d_minus = na::SVector::<f64, 30>::zeros();
+            d_minus[k] = -eps;
+            let p_minus = apply_delta_to_params(base_params, &d_minus, translation_is_local);
+            let (r_minus, _) = factor.linearize(&p_minus, false);
+
+            let dr = (r_plus - r_minus) * (0.5 / eps);
+            j_num.set_column(k, &dr);
+        }
+
+        j_num
+    }
+
+    fn print_jacobian_group_diffs(label: &str, j_analytic: &DMatrix<f64>, j_numeric: &DMatrix<f64>) {
+        let diff = j_analytic - j_numeric;
+        let groups = [
+            ("rot", 0usize, 3usize),
+            ("vel", 3usize, 3usize),
+            ("pos", 6usize, 3usize),
+            ("ba", 9usize, 3usize),
+            ("bg", 12usize, 3usize),
+        ];
+
+        let mut msg = String::new();
+        for (name, row_start, row_count) in groups {
+            let block = diff.view((row_start, 0), (row_count, diff.ncols()));
+            msg.push_str(&format!(" {}={:.3e}", name, block.amax()));
+        }
+        eprintln!("{}:{}", label, msg);
+    }
+
+    #[test]
+    fn test_imu_factor_residual_and_jacobian_fd() {
+        let mut rng = StdRng::seed_from_u64(42); // fixed seed for reproducibility
+        // Choose dt not too small (avoid numerical cancellation) and not too large (avoid large-angle issues).
+        let dt = 0.05;
+
+        // Gravity must match your factor's convention.
+        let g_w = Vector3::new(0.0, 0.0, 9.81007);
+
+        // Random-ish pose i
+        let t_i = Vector3::new(
+            rng.gen_range(-2.0..2.0),
+            rng.gen_range(-2.0..2.0),
+            rng.gen_range(-2.0..2.0),
+        );
+
+        // Keep rotations small-ish to avoid log-map edge cases.
+        let phi_i = Vector3::new(
+            rng.gen_range(-0.2..0.2),
+            rng.gen_range(-0.2..0.2),
+            rng.gen_range(-0.2..0.2),
+        );
+        let q_i = so3_exp_quat(phi_i);
+
+        let v_i = Vector3::new(
+            rng.gen_range(-1.0..1.0),
+            rng.gen_range(-1.0..1.0),
+            rng.gen_range(-1.0..1.0),
+        );
+
+        // Biases (set equal to factor.bias_* so correction terms are zero at GT)
+        let ba_i = Vector3::new(
+            rng.gen_range(-0.05..0.05),
+            rng.gen_range(-0.05..0.05),
+            rng.gen_range(-0.05..0.05),
+        );
+        let bg_i = Vector3::new(
+            rng.gen_range(-0.05..0.05),
+            rng.gen_range(-0.05..0.05),
+            rng.gen_range(-0.05..0.05),
+        );
+
+        // Create a consistent j state by applying a small motion
+        let dphi_ij = Vector3::new(
+            rng.gen_range(-0.1..0.1),
+            rng.gen_range(-0.1..0.1),
+            rng.gen_range(-0.1..0.1),
+        );
+        let q_j = (q_i * so3_exp_quat(dphi_ij)); // ensure unit norm
+
+        let a_w = Vector3::new(
+            rng.gen_range(-0.5..0.5),
+            rng.gen_range(-0.5..0.5),
+            rng.gen_range(-0.5..0.5),
+        );
+
+        // Simple constant-acceleration propagation in world frame for test data:
+        let v_j = v_i + (a_w + g_w) * dt;
+        let t_j = t_i + v_i * dt + 0.5 * (a_w + g_w) * dt * dt;
+
+        // Keep biases constant across i->j (random walk residuals should be 0)
+        let ba_j = ba_i;
+        let bg_j = bg_i;
+
+        // Build params blocks
+        let params = vec![
+            pose7(t_i, [q_i.w, q_i.i, q_i.j, q_i.k]),
+            speedbias9(v_i, ba_i, bg_i),
+            pose7(t_j, [q_j.w, q_j.i, q_j.j, q_j.k]),
+            speedbias9(v_j, ba_j, bg_j),
+        ];
+
+        // --- Construct a self-consistent preintegration object ---
+        // Goal: at GT, residuals should be ~0.
+        //
+        // Forster-style model (in i frame): ΔR = R_i^T R_j, Δv = R_i^T (v_j - v_i - g dt), Δp = R_i^T (t_j - t_i - v_i dt - 0.5 g dt^2). [file:2]
+        let r_i: Matrix3<f64> = q_i.to_rotation_matrix().into_inner();
+        let r_j: Matrix3<f64> = q_j.to_rotation_matrix().into_inner();
+        let r_i_t = r_i.transpose();
+
+        // You must adapt these conversions to your so3/se3 types.
+        let delta_r_mat = r_i_t * r_j;
+        let delta_v = r_i_t * (v_j - v_i + g_w * dt);
+        let delta_p = r_i_t * (t_j - t_i - v_i * dt + 0.5 * g_w * dt * dt);
+
+        // The key is: set dt, dR, dv, dp, bias linearization point (bias_a, bias_g),
+        // and make whitening identity (or consistent) so FD compares apples-to-apples.
+        let preint = make_preint_identity(dt, delta_r_mat, delta_v, delta_p);
+
+        // Factor biases must equal ba_i/bg_i used to define db_a/db_g=0 at GT
+        let factor = ImuFactor {
+            preint,
+            linearized_bias_a: ba_i,
+            linearized_bias_g: bg_i,
+            // ... fill any other fields you have ...
+        };
+
+        // --- Residual at GT should be ~0 ---
+        let (r_gt, j_opt) = factor.linearize(&params, true);
+        let j_analytic = j_opt.expect("Expected jacobian");
+
+        assert_eq!(r_gt.len(), 15);
+        assert_eq!(j_analytic.nrows(), 15);
+        assert_eq!(j_analytic.ncols(), 30);
+
+        let r_norm = r_gt.norm();
+        assert!(
+            r_norm < 1e-8,
+            "Residual at ground truth should be ~0, got norm={}, and residual {:?}",
+            r_norm,
+            r_gt
+        );
+
+        // --- Numeric Jacobian (central difference) ---
+        // Central difference is more accurate than forward difference for smooth functions. [web:22]
+        let eps = 1e-7;
+
+        let j_num_world = central_diff_jacobian(&factor, &params, eps, false);
+        let j_num_local = central_diff_jacobian(&factor, &params, eps, true);
+
+        // Compare both: your analytic code assumes one of these pose translation perturbations.
+        let diff_world = (&j_analytic - &j_num_world).amax();
+        let diff_local = (&j_analytic - &j_num_local).amax();
+
+        eprintln!("max|J_analytic - J_num_world| = {:.3e}", diff_world);
+        eprintln!("max|J_analytic - J_num_local| = {:.3e}", diff_local);
+
+        // Choose the one that matches best, but enforce that at least one is tight.
+        let best = diff_world.min(diff_local);
+        assert!(
+            best < 5e-5,
+            "Jacobian mismatch too large. best max-abs diff={:.3e} (world={:.3e}, local={:.3e})",
+            best, diff_world, diff_local
+        );
+    }
+
+    fn make_preint_identity(
+        dt: f64,
+        delta_r_mat: Matrix3<f64>,
+        delta_v: Vector3<f64>,
+        delta_p: Vector3<f64>,
+    ) -> PreInt {
+        let quat = UnitQuaternion::from_rotation_matrix(&na::Rotation3::from_matrix_unchecked(delta_r_mat));
+        PreInt { 
+            delta_R: so3::SO3::new(quat), 
+            delta_v: delta_v, 
+            delta_p: delta_p, 
+            cov: na::SMatrix::<f64, 15, 15>::identity(), 
+            dt, 
+            linearized_bg: na::Vector3::<f64>::zeros(), 
+            linearized_ba: na::Vector3::<f64>::zeros(), 
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(),
+            imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, 9.81007),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
+        }
+    }
+
 }
 

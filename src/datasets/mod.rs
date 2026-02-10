@@ -8,6 +8,7 @@ use camera_intrinsic_model::models::EUCM;
 use camera_intrinsic_model::generic_model::CameraModel;
 use nalgebra034; // TODO find a way to avoid this dependency (currently used for camera models)
 use crate::datasets::config::Config;
+use nalgebra as na;
 
 
 // Image data structure
@@ -21,8 +22,8 @@ pub struct ImageData {
 #[derive(Debug, Clone)]
 pub struct ImuData {
     pub timestamp: i64,
-    pub gyro: [f64; 3],
-    pub accel: [f64; 3],
+    pub gyro: na::Vector3<f64>,
+    pub accel: na::Vector3<f64>,
 }
 
 // Frame context for tracking processing state

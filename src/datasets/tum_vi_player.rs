@@ -73,7 +73,7 @@ impl TUMVIPlayer {
         let mut estimator = {
             let viewer_ref: Option<&mut dyn Viewer> =
                 viewer.as_deref_mut().map(|v| v as &mut dyn Viewer);
-            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam))
+            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam), None)
         };
         Self::initialize_estimator(&mut estimator, &image_data);
 
@@ -280,7 +280,7 @@ impl TUMVIPlayer {
         }
         
         // Get IMU data if VIO mode
-        let imu_data = if false && context.processed_frames > 0 { // TODO when implementing IMU data loading
+        let imu_data = if estimator.config.enable_imu && context.processed_frames > 0 { // TODO when implementing IMU data loading
             Some(Self::get_imu_data_between_frames(
                 context.previous_frame_timestamp,
                 image_data[context.current_idx].timestamp,

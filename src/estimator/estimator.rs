@@ -1,13 +1,17 @@
 use crate::datasets::ImuData;
-use crate::datasets::config::Config;
+use crate::datasets::config::{Config, ImuConfig};
 use crate::estimator::Frame;
 use crate::feature_tracker::StereoPatchTracker;
+use crate::imu;
+use crate::imu::piecewise_integration::{self, ImuPipeline, PreInt};
 use crate::types::{Matrix4x4, UnitQuaternion, Vector3};
 use crate::viewers::Viewer;
 use camera_intrinsic_model::GenericModel;
 use image::{DynamicImage, GrayImage};
 use anyhow::Result;
-use nalgebra as na;
+use nalgebra::{self as na, Vector6};
+use core::panic;
+use std::thread::current;
 use std::time::Instant;
 use crate::estimator::sliding_window::SlidingWindow;
 use crate::datasets::CameraModelType;
@@ -39,6 +43,19 @@ pub struct Estimator<'a> {
     T_B_Cr: Matrix4x4,
     // Full trajectory of keyframes
     trajectory: Vec<Matrix4x4>,
+    // IMU piecewise integration module
+    piecewise_integration: ImuPipeline,
+    // Velocities
+    velocities: Vec<Vector3>,
+    angular_velocities: Vec<Vector3>,
+    // IMU biases
+    gyro_biases: Vec<Vector3>,
+    accel_biases: Vec<Vector3>,
+
+    imu_buffer: Vec<ImuData>, // Buffer to store incoming IMU data for preintegration
+    first_frame: bool, // Flag to indicate if the current frame is the first frame (used for initialization)
+    first_imu: bool,
+    gravity_initialized: bool, // Flag to indicate if gravity has been initialized from IMU data
 }
 
 impl<'a> Estimator<'a> {
@@ -49,7 +66,7 @@ impl<'a> Estimator<'a> {
     ///
     /// The `viewer` reference must outlive the estimator.
     pub fn new(config: Config, viewer: Option<&'a mut dyn Viewer>) -> Self {
-        Self::new_with_cameras(config, viewer, None, None)
+        Self::new_with_cameras(config, viewer, None, None, None)
     }
 
     /// Create a new estimator with optional camera models.
@@ -61,8 +78,9 @@ impl<'a> Estimator<'a> {
         viewer: Option<&'a mut dyn Viewer>,
         left_cam: Option<CameraModelType>,
         right_cam: Option<CameraModelType>,
+        imu_config: Option<ImuConfig>,
     ) -> Self {
-        
+        let piecewise_integration = ImuPipeline::from_config(imu_config);
         // Use provided cameras or create from config
         let (left_cam, right_cam) = match (left_cam, right_cam) {
             (Some(l), Some(r)) => (l, r),
@@ -93,7 +111,16 @@ impl<'a> Estimator<'a> {
             right_cam,
             T_B_Cl: T_B_Cl,
             T_B_Cr: T_B_Cr,
-            trajectory: Vec::new()
+            trajectory: Vec::new(),
+            piecewise_integration: piecewise_integration,
+            velocities: Vec::new(),
+            angular_velocities: Vec::new(),
+            gyro_biases: Vec::new(),
+            accel_biases: Vec::new(),
+            imu_buffer: Vec::new(),
+            first_frame: true,
+            first_imu: true,
+            gravity_initialized: false,
         }
     }
 
@@ -106,6 +133,10 @@ impl<'a> Estimator<'a> {
         imu_data: Option<&[ImuData]>,
     ) -> Result<()> {
         let total_start_time = Instant::now();
+
+        if let Some(imu_data) = imu_data {
+            self.imu_buffer.extend_from_slice(imu_data);
+        }
 
         // New frame: update counters
         self.frame_id_counter += 1;
@@ -166,7 +197,6 @@ impl<'a> Estimator<'a> {
         let remaped = camera_intrinsic_model::remap(&img_l8, &xmap, &ymap);
         remaped.save("remaped0.png").unwrap();
         */
-        
 
         // Create frame (images are not stored, only features will be added)
         let mut current_frame = Frame::from_stereo_images(
@@ -176,6 +206,11 @@ impl<'a> Estimator<'a> {
             self.right_cam.clone(),
             self.T_B_Cl,
             self.T_B_Cr,
+            self.sliding_window.get_keyframe_poses().last().cloned(), // Use last keyframe pose as initial guess for current frame
+            self.sliding_window.get_keyframe_velocities().and_then(|v| v.last().copied()),
+            self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.last().copied()),
+            self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.last().copied()),
+            self.sliding_window.get_angular_velocities().and_then(|v| v.last().copied())
         );
 
         // Attach IMU measurements if available.
@@ -210,7 +245,6 @@ impl<'a> Estimator<'a> {
                         UnitQuaternion::from_matrix(&R_rel).euler_angles().1,
                         UnitQuaternion::from_matrix(&R_rel).euler_angles().2]
                     );
-                    log::debug!("[Estimator] Translation since last keyframe: {:.2?}, Euler angles since last keyframe: {:.2?}", t_rel, e_rel);
 
                     // Check if translation and rotation since last keyframe is large enough to trigger a keyframe
                     let translation_threshold = self.config.keyframe_management.translation_threshold;
@@ -237,24 +271,83 @@ impl<'a> Estimator<'a> {
             log::debug!("[Estimator] Sliding window is not full, skipping motion tracking");
         }
 
+        let mut imu_time_ms = 0.0f64;
         // View map points and keyframe poses
         // Bundle adjustment
         if current_frame.is_keyframe {
+            let imu_start = Instant::now();
+
+            
+            let init_rotation = if self.first_imu && imu_data.is_some() {
+                if imu_data.unwrap().len() < 5 {
+                    log::warn!("[Estimator] Not enough IMU data for initial preintegration (need at least 2 measurements), skipping IMU preintegration for this keyframe.");
+                    None
+                } else {
+                    log::info!("[Estimator] IMU data for preintegration: {:?}", imu_data.unwrap().len());
+                    Some(self.process_first_imu(&imu_data.unwrap()))
+                }
+            } else {
+                None
+            };
+            
+
+            log::debug!("IMU buffer size before preintegration: {}", self.imu_buffer.len());
+             if init_rotation.is_some() {
+                current_frame.state.T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&init_rotation.unwrap());
+                
+            }
+            if !self.imu_buffer.is_empty() {
+                let imu_ok = self.piecewise_integration.process_imu(
+                    &self.imu_buffer,
+                    &mut current_frame,
+                );
+                if !imu_ok {
+                    log::warn!("[Estimator] IMU propagation/preintegration rejected for this keyframe; continuing without fresh IMU preintegration.");
+                }
+            } else {
+                log::debug!("[Estimator] IMU disabled or no IMU data buffered; skipping IMU preintegration for this keyframe.");
+            }
+            self.imu_buffer.clear(); // Clear the buffer after preintegration
+            
+            // current_frame.add_imu(imu_preint);
+            imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
             let optimization_start = Instant::now();
             self.sliding_window.add_frame(current_frame);
             self.sliding_window.optimize(); // TODO handle error
             optimization_time_ms = optimization_start.elapsed().as_secs_f64() * 1000.0;
             self.view_optimization_results();
+            
+            
+            if self.sliding_window.check_sliding_window_size_for_optimization().is_ok() && !self.gravity_initialized && self.piecewise_integration.is_enabled() {
+                let initial_alignment_start = Instant::now();
+                self.sliding_window.solve_gyroscope_bias(&mut self.piecewise_integration);
+
+                let result = self.sliding_window.solve_linear_alignment();
+
+                let (g_refined, scale) = if result.is_ok() {
+                    self.gravity_initialized = true;
+                    result.unwrap()
+                } else {
+                    log::warn!("[Estimator] Linear alignment failed: {:?}. Using default gravity and scale.", result.err());
+                    (na::Vector3::<f64>::new(0.0, 0.0, 9.81007), 1.0)
+                };
+
+                self.piecewise_integration.set_gravity(g_refined);
+                let initial_alignment_duration_ms = initial_alignment_start.elapsed().as_secs_f64() * 1000.0;
+                log::debug!("[Timing] initial_alignment={:.3} ms", initial_alignment_duration_ms);
+                self.sliding_window.update_gravity(g_refined);
+            }
         }
         
         // Final timing summary
         let total_duration_ms = total_start_time.elapsed().as_secs_f64() * 1000.0;
         log::debug!(
-            "[Timing] frame_creation={:.3} ms, patch_tracking={:.3} ms, motion_tracking={:.3} ms, optimization={:.3} ms, total={:.3} ms",
+            "[Timing] frame_creation={:.3} ms, patch_tracking={:.3} ms, motion_tracking={:.3} ms, optimization={:.3} ms, imu={:.3} ms, total={:.3} ms",
             frame_creation_time_ms,
             patch_tracking_time_ms,
             motion_tracking_time_ms,
             optimization_time_ms,
+            imu_time_ms,
             total_duration_ms
         );
     
@@ -266,6 +359,38 @@ impl<'a> Estimator<'a> {
         if let Some(v) = &mut self.viewer {
             v.set_frame(frame_id);
         }
+    }
+
+    fn process_first_imu(&mut self, imu_data: &[ImuData]) -> na::Matrix3<f64> {
+        self.first_imu = false;
+
+        let mut avg_accel = Vector3::zeros();
+        let n = imu_data.len() as f64;
+        for data in imu_data {
+            avg_accel += Vector3::new(data.accel[0], data.accel[1], data.accel[2]);
+        }
+        avg_accel /= n;
+        log::info!("[Estimator] Average accel from first IMU batch: {:?}", avg_accel);
+
+        let init_rotation = self.gravity_to_rotation(&avg_accel);
+        log::info!("[Estimator] Initial rotation from gravity: \n{}", init_rotation);
+        init_rotation
+    }
+
+    fn gravity_to_rotation(&self, g: &Vector3) -> na::Matrix3<f64> {
+        let ng1 = g.normalize();
+        let ng2 = na::Vector3::new(0.0, 0.0, 1.0);
+
+        let R = na::UnitQuaternion::rotation_between(&ng1, &ng2).unwrap_or_else(|| {
+            // ng1 and ng2 are opposite; choose any axis perpendicular to ng1.
+            let helper = if ng1.x.abs() < 0.9 { na::Vector3::x() } else { na::Vector3::y() };
+            let axis = na::Unit::new_normalize(ng1.cross(&helper));
+            na::UnitQuaternion::from_axis_angle(&axis, std::f64::consts::PI)
+        });
+
+        let yaw = R.euler_angles().2;
+        let q0 = na::UnitQuaternion::from_euler_angles(0.0, 0.0, -yaw) * R;
+        q0.to_rotation_matrix().into_inner()
     }
 
     /// Visualize tracking results: stereo images with tracked features.
@@ -354,8 +479,35 @@ impl<'a> Estimator<'a> {
             }
 
             // History of keyframe poses
-            let mat =  self.sliding_window.get_keyframe_poses().first().unwrap().clone();
+            // let mat =  self.sliding_window.get_keyframe_poses().first().unwrap().clone();
+            // TODO: currently safegaurding against jumps but needs to be put back once the optimization is stable
+            let kf_len = self.sliding_window.get_keyframe_poses().len();
+            let mat =  if kf_len > 1 {
+                self.sliding_window.get_keyframe_poses().get(1).unwrap().clone()
+            } else {
+                self.sliding_window.get_keyframe_poses().first().unwrap().clone()
+            };
             self.trajectory.push(mat);
+
+            let vel = self.sliding_window.get_keyframe_velocities().and_then(|v| v.first().copied());
+            if let Some(vel) = vel {
+                self.velocities.push(vel);
+            }
+
+            let ba = self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.first().copied());
+            if let Some(ba) = ba {
+                self.accel_biases.push(ba);
+            }
+
+            let bg = self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.first().copied());
+            if let Some(bg) = bg {
+                self.gyro_biases.push(bg);
+            }
+
+            let ang_vel = self.sliding_window.get_angular_velocities().and_then(|v| v.first().copied());
+            if let Some(ang_vel) = ang_vel {
+                self.angular_velocities.push(ang_vel);
+            }
             
             // Display trajectory as a continuous 3D path
             v.log_trajectory(&self.trajectory, "trajectory/path");
