@@ -73,7 +73,7 @@ impl FourSeasonsPlayer {
         let mut estimator = {
             let viewer_ref: Option<&mut dyn Viewer> =
                 viewer.as_deref_mut().map(|v| v as &mut dyn Viewer);
-            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam))
+            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam), None)
         };
         Self::initialize_estimator(&mut estimator, &image_data);
 

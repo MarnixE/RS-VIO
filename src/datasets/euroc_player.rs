@@ -5,11 +5,11 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 use image::{ImageReader};
-use crate::imu;
+use crate::imu::{self, midpoint_integration};
 use crate::viewers::{Viewer, create_viewer};
 use crate::estimator::Estimator;
 use crate::datasets::{config::Config, ImageData, ImuData, FrameContext, PlayerConfig, PlayerResult, config::ImuConfig};
-
+use nalgebra as na;
 
 pub struct EurocPlayer;
 
@@ -48,6 +48,7 @@ impl EurocPlayer {
                 return result;
             }
         };
+        // let midpoint_integration = midpoint_integration::ImuMidpointIntegration::from_config(&imu_config);
 
         let start_frame_idx = 0;
         let end_frame_idx = image_data.len();
@@ -87,7 +88,7 @@ impl EurocPlayer {
         let mut estimator = {
             let viewer_ref: Option<&mut dyn Viewer> =
                 viewer.as_deref_mut().map(|v| v as &mut dyn Viewer);
-            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam))
+            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam), Some(imu_config))
         };
         Self::initialize_estimator(&mut estimator, &image_data);
 
@@ -360,8 +361,8 @@ impl EurocPlayer {
                 ) {
                     imu_measurements.push(ImuData {
                         timestamp,
-                        gyro: [gyro_x, gyro_y, gyro_z],
-                        accel: [accel_x, accel_y, accel_z],
+                        gyro: na::Vector3::new(gyro_x, gyro_y, gyro_z),
+                        accel: na::Vector3::new(accel_x, accel_y, accel_z),
                     });
                 }
             }
@@ -421,11 +422,7 @@ impl EurocPlayer {
         // Process frame
         let imu_slice = imu_result.as_ref().map(|v| v.as_slice());
         print!("IMU slice for frame {}: ", context.current_idx);
-        if let Some(slice) = imu_slice {
-            println!("{:?}", slice);
-        } else {
-            println!("None");
-        }
+
         estimator.process_frame(
             &left_image,
             &right_image,

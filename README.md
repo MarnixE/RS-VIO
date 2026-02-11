@@ -66,6 +66,7 @@ This is my current plan, subject to change over time. Contributions are welcome 
 ### Phase 2 - Near future
 - [ ] Small refactoring and code clean-up (coming soon)
 - [ ] IMU data processing (coming soon)
+- [ ] IMU data processing for TUM/4 Seasons
 - [ ] Constant velocity model* 
 - [ ] Marginalization of old keyframes and keypoints**
 - [ ] ROS wrapper

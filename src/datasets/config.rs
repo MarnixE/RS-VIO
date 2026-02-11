@@ -68,20 +68,30 @@ pub struct OptimizationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct T_BSConfig {
+    #[serde(rename = "cols")]
+    pub cols: i32,
+    #[serde(rename = "rows")]
+    pub rows: i32,
+    #[serde(rename = "data")]
+    pub data: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImuConfig {
     #[serde(rename = "sensor_type")]
     pub sensor_type: Option<String>,
     #[serde(rename = "rate_hz")]
     pub rate_hz: Option<f64>,
     #[serde(rename = "T_BS")]
-    pub T_BS: Vec<f64>,
-    #[serde(rename = "accel_noise_density")]
+    pub T_BS: T_BSConfig,
+    #[serde(rename = "accelerometer_noise_density")]
     pub accel_noise_density: f64,
-    #[serde(rename = "gyro_noise_density")]
+    #[serde(rename = "gyroscope_noise_density")]
     pub gyro_noise_density: f64,
-    #[serde(rename = "accel_random_walk")]
+    #[serde(rename = "accelerometer_random_walk")]
     pub accel_random_walk: f64,
-    #[serde(rename = "gyro_random_walk")]
+    #[serde(rename = "gyroscope_random_walk")]
     pub gyro_random_walk: f64,
 }
 

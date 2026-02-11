@@ -1,7 +1,9 @@
 use crate::datasets::ImuData;
-use crate::datasets::config::Config;
+use crate::datasets::config::{Config, ImuConfig};
 use crate::estimator::Frame;
 use crate::feature_tracker::StereoPatchTracker;
+use crate::imu;
+use crate::imu::midpoint_integration::{self, ImuMidpointIntegration};
 use crate::types::{Matrix4x4, UnitQuaternion, Vector3};
 use crate::viewers::Viewer;
 use camera_intrinsic_model::GenericModel;
@@ -39,6 +41,8 @@ pub struct Estimator<'a> {
     T_B_Cr: Matrix4x4,
     // Full trajectory of keyframes
     trajectory: Vec<Matrix4x4>,
+    // IMU midpoint integration module
+    midpoint_integration: ImuMidpointIntegration,
 }
 
 impl<'a> Estimator<'a> {
@@ -49,7 +53,7 @@ impl<'a> Estimator<'a> {
     ///
     /// The `viewer` reference must outlive the estimator.
     pub fn new(config: Config, viewer: Option<&'a mut dyn Viewer>) -> Self {
-        Self::new_with_cameras(config, viewer, None, None)
+        Self::new_with_cameras(config, viewer, None, None, None)
     }
 
     /// Create a new estimator with optional camera models.
@@ -61,8 +65,14 @@ impl<'a> Estimator<'a> {
         viewer: Option<&'a mut dyn Viewer>,
         left_cam: Option<CameraModelType>,
         right_cam: Option<CameraModelType>,
+        imu_config: Option<ImuConfig>,
     ) -> Self {
-        
+        // let imu_config = imu_config.unwrap();
+        let midpoint_integration = if imu_config.is_some() {
+            ImuMidpointIntegration::from_config(imu_config.unwrap())
+        } else {
+            ImuMidpointIntegration::new()
+        };
         // Use provided cameras or create from config
         let (left_cam, right_cam) = match (left_cam, right_cam) {
             (Some(l), Some(r)) => (l, r),
@@ -93,7 +103,8 @@ impl<'a> Estimator<'a> {
             right_cam,
             T_B_Cl: T_B_Cl,
             T_B_Cr: T_B_Cr,
-            trajectory: Vec::new()
+            trajectory: Vec::new(),
+            midpoint_integration: midpoint_integration,
         }
     }
 
@@ -152,6 +163,8 @@ impl<'a> Estimator<'a> {
                 return Ok(());
             }
         };
+
+        let result = self.midpoint_integration.integrate(imu_data.unwrap_or(&[]));
 
         /*
         // For debugging with TUM-VI: undistort the images with EUCM and save the result
