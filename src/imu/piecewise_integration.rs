@@ -1,22 +1,71 @@
+use std::fmt;
+
 use crate::{datasets::{ImuData, config}, imu};
 use imageproc::noise;
-use nalgebra as na;
+use nalgebra::{self as na, Cholesky};
 use apex_solver::manifold::{LieGroup, so3::SO3};
 
+type Mat9 = na::SMatrix<f64, 9, 9>;
+type Vec9 = na::SVector<f64, 9>;
+
+#[derive(Clone)]
 #[allow(non_snake_case, dead_code)]
 pub struct PreInt {
-    dR: SO3,
-    dv: na::Vector3<f64>,
-    dp: na::Vector3<f64>,
-    cov: na::SMatrix<f64, 9, 9>,
-    dt: f64,
-    bias_g: na::Vector3<f64>,
-    bias_a: na::Vector3<f64>,
-    Jr_bg: na::Matrix3<f64>,
-    Jv_bg: na::Matrix3<f64>,
-    Jv_ba: na::Matrix3<f64>,
-    Jp_bg: na::Matrix3<f64>,
-    Jp_ba: na::Matrix3<f64>,
+    pub dR: SO3,
+    pub dv: na::Vector3<f64>,
+    pub dp: na::Vector3<f64>,
+    pub cov: Mat9,
+    pub dt: f64,
+    pub bias_g: na::Vector3<f64>,
+    pub bias_a: na::Vector3<f64>,
+    pub Jr_bg: na::Matrix3<f64>,
+    pub Jv_bg: na::Matrix3<f64>,
+    pub Jv_ba: na::Matrix3<f64>,
+    pub Jp_bg: na::Matrix3<f64>,
+    pub Jp_ba: na::Matrix3<f64>,
+
+    pub inv_chol: Mat9,
+}
+
+impl fmt::Debug for PreInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreInt")
+            .field("dR", &"<SO3>")
+            .field("dv", &self.dv)
+            .field("dp", &self.dp)
+            .field("dt", &self.dt)
+            .field("bias_g", &self.bias_g)
+            .field("bias_a", &self.bias_a)
+            .finish()
+    }
+}
+
+impl PreInt {
+    pub fn finalize(&mut self) {
+        // Symmetrize (numerical hygiene)
+        let sigma = 0.5 * (self.cov + self.cov.transpose());
+
+        // Cholesky Σ = L L^T
+        let chol = Cholesky::new(sigma)
+            .expect("Preint covariance not SPD; check propagation / add jitter");
+
+        let L = chol.l();
+
+        // W = L^{-1}  (triangular inverse is fine for 9x9)
+        let W = L
+            .try_inverse()
+            .expect("Failed to invert Cholesky factor");
+
+        self.inv_chol = W.clone();
+    }
+
+    pub fn whiten_residual(&self, r: &Vec9) -> Vec9 {
+        self.inv_chol * r
+    }
+
+    pub fn whiten_jacobian<const N: usize>(&self, J: &na::SMatrix<f64, 9, N>) -> na::SMatrix<f64, 9, N> {
+        self.inv_chol * J
+    }
 }
 
 pub struct ImuPiecewiseIntegration {
@@ -152,6 +201,7 @@ impl ImuPiecewiseIntegration {
             Jv_ba: Jv_ba, // Placeholder for Jacobian w.r.t accel bias
             Jp_bg: Jp_bg, // Placeholder for Jacobian w.r.t gyro bias
             Jp_ba: Jp_ba, // Placeholder for Jacobian w.r.t accel bias
+            inv_chol: self.compute_inv_chol(&cov_ik), // Compute square root information matrix
         }
     }
 
@@ -226,6 +276,20 @@ impl ImuPiecewiseIntegration {
         let Qa = (sigma_a * sigma_a / dt) * I3; // Σ_ad
         na::stack![Qg, 0; 
             0, Qa]
+    }
+
+    pub fn compute_inv_chol(&self, sigma: &Mat9) -> Mat9 {
+        // 1) Symmetrize (numerical hygiene)
+        let sigma = 0.5 * (sigma + sigma.transpose());
+
+        // 2) Cholesky: Σ = L L^T
+        let chol = na::Cholesky::new(sigma)
+            .expect("Σ not SPD; check noise propagation or add jitter");
+
+        let L = chol.l();
+
+        // 3) sqrt_info = L^{-1}
+        L.try_inverse().expect("Failed to invert L")
     }
 
 }

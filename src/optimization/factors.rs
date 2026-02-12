@@ -1,7 +1,10 @@
-use nalgebra as na;
+use faer::linalg::jacobi;
+use nalgebra::{self as na, Rotation3, dvector};
 use na::{DVector, DMatrix, Vector3, Vector2, Matrix4, UnitQuaternion, Matrix3};
 use apex_solver::factors::Factor;
-use apex_solver::manifold::se3;
+use apex_solver::manifold::{LieGroup, Tangent, se3, so3};
+
+use crate::imu::piecewise_integration::PreInt;
 
 /// Pinhole projection factor for optimizing 3D point positions from camera observations.
 ///
@@ -587,9 +590,9 @@ impl Factor for PnPFactor {
 #[derive(Debug, Clone)]
 pub struct IMUFactor {
     /// Preintegrated IMU measurement: (delta position, delta velocity, delta orientation)
-    pub delta_p: Vector3<f64>,
-    pub delta_v: Vector3<f64>,
-    pub delta_q: UnitQuaternion<f64>,
+    pub preint: PreInt,
+    pub gyro_random_walk: f64,
+    pub accel_random_walk: f64,
 }
 
 impl Factor for IMUFactor {
@@ -598,8 +601,79 @@ impl Factor for IMUFactor {
         params: &[DVector<f64>],
         compute_jacobian: bool,
     ) -> (DVector<f64>, Option<DMatrix<f64>>) {
-        // TODO implement IMU factor linearization
-        unimplemented!()
+        assert_eq!(params.len(), 2, "IMUFactor requires 2 parameter vectors");
+        assert_eq!(params[0].len(), 16, "System pose must have 16 parameters (tx, ty, tz, qw, qx, qy, qz, vx, vy, vz, ba_x, ba_y, ba_z, bg_x, bg_y, bg_z)");
+        assert_eq!(params[1].len(), 16, "System pose must have 16 parameters (tx, ty, tz, qw, qx, qy, qz, vx, vy, vz, ba_x, ba_y, ba_z, bg_x, bg_y, bg_z)");
+        
+        let T_B_W_i = se3::SE3::from(params[0].rows(0, 7).clone_owned());
+        let T_B_W_j = se3::SE3::from(params[1].rows(0, 7).clone_owned());
+        let v_i = params[0].rows(7, 3).clone_owned();
+        let v_j = params[1].rows(7, 3).clone_owned();
+        let ba_i = params[0].rows(10, 3).clone_owned();
+        let ba_j = params[1].rows(10, 3).clone_owned();
+        let bg_i = params[0].rows(13, 3).clone_owned();
+        let bg_j = params[1].rows(13, 3).clone_owned();
+
+        let db_g = bg_i - self.preint.bias_g;
+        let db_a = ba_i - self.preint.bias_a;
+        
+        let R_i = T_B_W_i.rotation_so3();
+        let R_j = T_B_W_j.rotation_so3();
+        
+        let delta_bg = self.preint.Jr_bg * db_g.clone();
+        let delta_bg_dyn: DVector<f64> = dvector![delta_bg.x, delta_bg.y, delta_bg.z]; 
+
+        let dR_corr = self.preint.dR.compose(
+            &so3::SO3Tangent::from(delta_bg_dyn).exp(None),
+            None,
+            None
+        );
+        let dv_corr = self.preint.dv + self.preint.Jv_bg * db_g.clone() + self.preint.Jv_ba * db_a.clone();
+        let dp_corr = self.preint.dp + self.preint.Jp_bg * db_g + self.preint.Jp_ba * db_a;
+
+        let residual_dR = dR_corr.inverse(None)
+            .compose(&R_i.inverse(None), None, None)
+            .compose(&R_j, None, None).log(None);
+
+        let g_w = Vector3::new(0.0, 0.0, -9.81);
+        let R_i_inv: Matrix3<f64> = R_i.inverse(None).rotation_matrix().into();
+        let v_diff = Vector3::new(v_j[0] - v_i[0] - g_w.x * self.preint.dt,
+                                   v_j[1] - v_i[1] - g_w.y * self.preint.dt,
+                                   v_j[2] - v_i[2] - g_w.z * self.preint.dt);
+        let residual_dv = R_i_inv * v_diff - dv_corr;
+        let residual_dp = R_i_inv * (T_B_W_j.translation() - T_B_W_i.translation() - v_i * self.preint.dt 
+            - 0.5 * g_w * self.preint.dt * self.preint.dt) - dp_corr;
+        
+        // Convert SO3Tangent to DVector
+        let residual_dR_vec: DVector<f64> = residual_dR.into();
+        
+        // Concatenate all residuals into a single fixed-size Vector9
+        let mut residuals_fixed = na::SVector::<f64, 9>::zeros();
+        residuals_fixed.rows_mut(0, 3).copy_from(&residual_dR_vec);
+        residuals_fixed.rows_mut(3, 3).copy_from(&residual_dv);
+        residuals_fixed.rows_mut(6, 3).copy_from(&residual_dp);
+        
+        let jacobian_matrix = if compute_jacobian {
+            // TODO: Implement Jacobian computation
+            Some(DMatrix::zeros(9, 32))
+        } else {
+            None
+        };
+
+        let residuals_whitened = self.preint.whiten_residual(&residuals_fixed);
+        let residuals = DVector::from_vec(residuals_whitened.as_slice().to_vec());
+
+        let jacobian_matrix = if let Some(jac) = jacobian_matrix {
+            // Convert DMatrix to SMatrix<f64, 9, 32> for whitening
+            let jac_static = na::SMatrix::<f64, 9, 32>::from_iterator(jac.iter().cloned());
+            let jacobian_matrix_whitened = self.preint.whiten_jacobian(&jac_static);
+            // Convert back to DMatrix
+            Some(DMatrix::from_iterator(9, 32, jacobian_matrix_whitened.iter().cloned()))
+        } else {
+            None
+        };
+        
+        (residuals, jacobian_matrix)
     }
 
     fn get_dimension(&self) -> usize {
