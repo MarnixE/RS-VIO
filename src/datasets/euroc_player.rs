@@ -5,7 +5,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 use image::{ImageReader};
-use crate::imu::{self, midpoint_integration};
+use crate::imu::{self, piecewise_integration};
 use crate::viewers::{Viewer, create_viewer};
 use crate::estimator::Estimator;
 use crate::datasets::{config::Config, ImageData, ImuData, FrameContext, PlayerConfig, PlayerResult, config::ImuConfig};

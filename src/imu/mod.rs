@@ -1,2 +1,2 @@
 pub mod factors;
-pub mod midpoint_integration;
+pub mod piecewise_integration;

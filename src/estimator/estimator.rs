@@ -3,7 +3,7 @@ use crate::datasets::config::{Config, ImuConfig};
 use crate::estimator::Frame;
 use crate::feature_tracker::StereoPatchTracker;
 use crate::imu;
-use crate::imu::midpoint_integration::{self, ImuMidpointIntegration};
+use crate::imu::piecewise_integration::{self, ImuPiecewiseIntegration, PreInt};
 use crate::types::{Matrix4x4, UnitQuaternion, Vector3};
 use crate::viewers::Viewer;
 use camera_intrinsic_model::GenericModel;
@@ -41,8 +41,8 @@ pub struct Estimator<'a> {
     T_B_Cr: Matrix4x4,
     // Full trajectory of keyframes
     trajectory: Vec<Matrix4x4>,
-    // IMU midpoint integration module
-    midpoint_integration: ImuMidpointIntegration,
+    // IMU piecewise integration module
+    piecewise_integration: ImuPiecewiseIntegration,
 }
 
 impl<'a> Estimator<'a> {
@@ -68,10 +68,10 @@ impl<'a> Estimator<'a> {
         imu_config: Option<ImuConfig>,
     ) -> Self {
         // let imu_config = imu_config.unwrap();
-        let midpoint_integration = if imu_config.is_some() {
-            ImuMidpointIntegration::from_config(imu_config.unwrap())
+        let piecewise_integration = if imu_config.is_some() {
+            ImuPiecewiseIntegration::from_config(imu_config.unwrap())
         } else {
-            ImuMidpointIntegration::new()
+            ImuPiecewiseIntegration::new()
         };
         // Use provided cameras or create from config
         let (left_cam, right_cam) = match (left_cam, right_cam) {
@@ -104,7 +104,7 @@ impl<'a> Estimator<'a> {
             T_B_Cl: T_B_Cl,
             T_B_Cr: T_B_Cr,
             trajectory: Vec::new(),
-            midpoint_integration: midpoint_integration,
+            piecewise_integration: piecewise_integration,
         }
     }
 
@@ -163,8 +163,9 @@ impl<'a> Estimator<'a> {
                 return Ok(());
             }
         };
-
-        let result = self.midpoint_integration.integrate(imu_data.unwrap_or(&[]));
+        let imu_start = Instant::now();
+        let result = self.piecewise_integration.integrate(imu_data.unwrap_or(&[]));
+        let imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
 
         /*
         // For debugging with TUM-VI: undistort the images with EUCM and save the result
@@ -263,11 +264,12 @@ impl<'a> Estimator<'a> {
         // Final timing summary
         let total_duration_ms = total_start_time.elapsed().as_secs_f64() * 1000.0;
         log::debug!(
-            "[Timing] frame_creation={:.3} ms, patch_tracking={:.3} ms, motion_tracking={:.3} ms, optimization={:.3} ms, total={:.3} ms",
+            "[Timing] frame_creation={:.3} ms, patch_tracking={:.3} ms, motion_tracking={:.3} ms, optimization={:.3} ms, imu={:.3} ms, total={:.3} ms",
             frame_creation_time_ms,
             patch_tracking_time_ms,
             motion_tracking_time_ms,
             optimization_time_ms,
+            imu_time_ms,
             total_duration_ms
         );
     
