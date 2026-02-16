@@ -8,7 +8,7 @@ use apex_solver::core::loss_functions::HuberLoss;
 use std::collections::HashMap;
 use nalgebra as na;
 use na::{DVector, UnitQuaternion};
-use crate::optimization::factors::{BundleAdjustmentFactor, PnPFactor};
+use crate::optimization::factors::{BundleAdjustmentFactor, PnPFactor, ImuFactor};
 use crate::optimization::observer::TerminalObserver;
 use crate::estimator::Frame;
 use crate::types::{Matrix3x3, Matrix4x4, Vector3};
@@ -115,6 +115,18 @@ impl SlidingWindow {
     pub fn get_keyframe_poses(&self) -> Vec<Matrix4x4> {
         // Return poses of body in world frame
         self.keyframes.iter().map(|f| f.state.T_W_B).collect()
+    }
+
+    pub fn get_keyframe_velocities(&self) -> Vec<Vector3> {
+        self.keyframes.iter().map(|f| f.state.velocity).collect()
+    }
+
+    pub fn get_keyframe_accel_bias(&self) -> Vec<Vector3> {
+        self.keyframes.iter().map(|f| f.state.accel_bias).collect()
+    }
+
+    pub fn get_keyframe_gyro_bias(&self) -> Vec<Vector3> {
+        self.keyframes.iter().map(|f| f.state.gyro_bias).collect()
     }
 
     /// Clear all keyframes from the sliding window.
@@ -231,6 +243,16 @@ impl SlidingWindow {
                 (&frame.right_features, T_Cr_B),
             ];
             
+            if frame.imu_preintegration.is_some() {
+                let imu_factor = ImuFactor::new(
+                    frame.imu_preintegration.as_ref().unwrap().clone(),
+                    frame.state.accel_bias,
+                    frame.state.gyro_bias,
+                );
+
+                problem.add_residual_block(&[&kf_var], Box::new(imu_factor), None);
+            };
+            
             for (features, T_C_B) in camera_features.iter() {
                 for feat in features.iter() {
                     let feature_id = feat.feature_id;
@@ -297,8 +319,7 @@ impl SlidingWindow {
                     }
                 }
             }
-        }                    
-
+        }
 
         let num_residuals = problem.num_residual_blocks();
         let num_variables = initial_values.len();

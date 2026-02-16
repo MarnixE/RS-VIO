@@ -9,7 +9,7 @@ use crate::viewers::Viewer;
 use camera_intrinsic_model::GenericModel;
 use image::{DynamicImage, GrayImage};
 use anyhow::Result;
-use nalgebra as na;
+use nalgebra::{self as na, Vector6};
 use std::time::Instant;
 use crate::estimator::sliding_window::SlidingWindow;
 use crate::datasets::CameraModelType;
@@ -43,6 +43,11 @@ pub struct Estimator<'a> {
     trajectory: Vec<Matrix4x4>,
     // IMU piecewise integration module
     piecewise_integration: ImuPiecewiseIntegration,
+    // IMU biases
+    velocities: Vec<Vector3>,
+    // IMU biases
+    gyro_biases: Vec<Vector3>,
+    accel_biases: Vec<Vector3>,
 }
 
 impl<'a> Estimator<'a> {
@@ -105,6 +110,9 @@ impl<'a> Estimator<'a> {
             T_B_Cr: T_B_Cr,
             trajectory: Vec::new(),
             piecewise_integration: piecewise_integration,
+            velocities: Vec::new(),
+            gyro_biases: Vec::new(),
+            accel_biases: Vec::new(),
         }
     }
 
@@ -163,9 +171,6 @@ impl<'a> Estimator<'a> {
                 return Ok(());
             }
         };
-        let imu_start = Instant::now();
-        let result = self.piecewise_integration.integrate(imu_data.unwrap_or(&[]));
-        let imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
 
         /*
         // For debugging with TUM-VI: undistort the images with EUCM and save the result
@@ -180,7 +185,6 @@ impl<'a> Estimator<'a> {
         let remaped = camera_intrinsic_model::remap(&img_l8, &xmap, &ymap);
         remaped.save("remaped0.png").unwrap();
         */
-        
 
         // Create frame (images are not stored, only features will be added)
         let mut current_frame = Frame::from_stereo_images(
@@ -190,6 +194,9 @@ impl<'a> Estimator<'a> {
             self.right_cam.clone(),
             self.T_B_Cl,
             self.T_B_Cr,
+            self.velocities.last().copied(),
+            self.accel_biases.last().copied(),
+            self.gyro_biases.last().copied(),
         );
 
         // Attach IMU measurements if available.
@@ -251,9 +258,19 @@ impl<'a> Estimator<'a> {
             log::debug!("[Estimator] Sliding window is not full, skipping motion tracking");
         }
 
+        let mut imu_time_ms = 0.0f64;
         // View map points and keyframe poses
         // Bundle adjustment
         if current_frame.is_keyframe {
+            let imu_start = Instant::now();
+            let imu_preint = self.piecewise_integration.integrate(
+                imu_data.unwrap_or(&[]),
+                &self.accel_biases.last().unwrap_or(&Vector3::zeros()),
+                &self.gyro_biases.last().unwrap_or(&Vector3::zeros()),
+            );
+            current_frame.add_imu_preint(imu_preint);
+            imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
+
             let optimization_start = Instant::now();
             self.sliding_window.add_frame(current_frame);
             self.sliding_window.optimize(); // TODO handle error
@@ -371,6 +388,15 @@ impl<'a> Estimator<'a> {
             // History of keyframe poses
             let mat =  self.sliding_window.get_keyframe_poses().first().unwrap().clone();
             self.trajectory.push(mat);
+
+            let vel = self.sliding_window.get_keyframe_velocities().first().unwrap().clone();
+            self.velocities.push(vel);
+
+            let ba = self.sliding_window.get_keyframe_accel_bias().first().unwrap().clone();
+            self.velocities.push(ba);
+
+            let bg = self.sliding_window.get_keyframe_gyro_bias().first().unwrap().clone();
+            self.velocities.push(bg);
             
             // Display trajectory as a continuous 3D path
             v.log_trajectory(&self.trajectory, "trajectory/path");

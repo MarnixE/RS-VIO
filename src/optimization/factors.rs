@@ -585,25 +585,70 @@ impl Factor for PnPFactor {
     }
 }
 
+fn set_block_3x3(J: &mut na::SMatrix<f64, 9, 26>, row: usize, col: usize, B: &na::SMatrix<f64, 3, 3>) {
+    J.fixed_view_mut::<3,3>(row, col).copy_from(B);
+}
+
+fn set_block_3x3_dyn(J: &mut na::SMatrix<f64, 9, 26>, row: usize, col: usize, B: &na::SMatrix<f64,3,3>) {
+    J.fixed_view_mut::<3,3>(row, col).copy_from(B);
+}
+
+fn right_jacobian_inv(phi: &na::Vector3<f64>) -> na::Matrix3<f64> {
+    let a = phi.norm();
+    if a < 1e-8 {
+        // series: I + 0.5*phi^ + 1/12*(phi^)2 ...
+        let ph = skew_symmetric(phi);
+        return na::Matrix3::<f64>::identity() + 0.5 * ph + (1.0 / 12.0) * (ph * ph);
+    }
+    let ph = skew_symmetric(phi);
+    let a2 = a * a;
+    let cot = (a * 0.5).cos() / (a * 0.5).sin(); // cot(a/2)
+    na::Matrix3::<f64>::identity()
+        + 0.5 * ph
+        + (1.0 / a2) * (1.0 - 0.5 * a * cot) * (ph * ph)
+}
+
+fn so3_log(R: &na::Matrix3<f64>) -> na::Vector3<f64> {
+    let tr = R[(0,0)] + R[(1,1)] + R[(2,2)];
+    let cos_theta = ((tr - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let theta = cos_theta.acos();
+    if theta < 1e-8 {
+        return na::Vector3::zeros();
+    }
+    let w_hat = (R - R.transpose()) * (0.5 * theta / theta.sin());
+    na::Vector3::new(w_hat[(2,1)], w_hat[(0,2)], w_hat[(1,0)])
+}
 
 
 #[derive(Debug, Clone)]
-pub struct IMUFactor {
+pub struct ImuFactor {
     /// Preintegrated IMU measurement: (delta position, delta velocity, delta orientation)
     pub preint: PreInt,
-    pub gyro_random_walk: f64,
-    pub accel_random_walk: f64,
+    pub bias_a: na::Vector3<f64>,
+    pub bias_g: na::Vector3<f64>,
 }
 
-impl Factor for IMUFactor {
+impl ImuFactor {
+    pub fn new(preint: PreInt, bias_a: na::Vector3<f64>, bias_g: na::Vector3<f64>) -> Self {
+        Self {
+            preint,
+            bias_a,
+            bias_g,
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+impl Factor for ImuFactor {
     fn linearize(
         &self,
         params: &[DVector<f64>],
         compute_jacobian: bool,
     ) -> (DVector<f64>, Option<DMatrix<f64>>) {
-        assert_eq!(params.len(), 2, "IMUFactor requires 2 parameter vectors");
+        log::debug!("Number of parmas {:?}", params[0].len());
+        assert_eq!(params.len(), 2, "ImuFactor requires 2 parameter vectors");
         assert_eq!(params[0].len(), 16, "System pose must have 16 parameters (tx, ty, tz, qw, qx, qy, qz, vx, vy, vz, ba_x, ba_y, ba_z, bg_x, bg_y, bg_z)");
-        assert_eq!(params[1].len(), 16, "System pose must have 16 parameters (tx, ty, tz, qw, qx, qy, qz, vx, vy, vz, ba_x, ba_y, ba_z, bg_x, bg_y, bg_z)");
+        assert_eq!(params[1].len(), 10, "System pose must have 16 parameters (tx, ty, tz, qw, qx, qy, qz, vx, vy, vz)");
         
         let T_B_W_i = se3::SE3::from(params[0].rows(0, 7).clone_owned());
         let T_B_W_j = se3::SE3::from(params[1].rows(0, 7).clone_owned());
@@ -614,12 +659,14 @@ impl Factor for IMUFactor {
         let bg_i = params[0].rows(13, 3).clone_owned();
         let bg_j = params[1].rows(13, 3).clone_owned();
 
-        let db_g = bg_i - self.preint.bias_g;
-        let db_a = ba_i - self.preint.bias_a;
+        let db_g = bg_i - self.bias_g;
+        let db_a = ba_i - self.bias_a;
         
         let R_i = T_B_W_i.rotation_so3();
         let R_j = T_B_W_j.rotation_so3();
-        
+        let t_i = T_B_W_i.translation();
+        let t_j = T_B_W_j.translation();
+
         let delta_bg = self.preint.Jr_bg * db_g.clone();
         let delta_bg_dyn: DVector<f64> = dvector![delta_bg.x, delta_bg.y, delta_bg.z]; 
 
@@ -641,34 +688,81 @@ impl Factor for IMUFactor {
                                    v_j[1] - v_i[1] - g_w.y * self.preint.dt,
                                    v_j[2] - v_i[2] - g_w.z * self.preint.dt);
         let residual_dv = R_i_inv * v_diff - dv_corr;
-        let residual_dp = R_i_inv * (T_B_W_j.translation() - T_B_W_i.translation() - v_i * self.preint.dt 
+        let residual_dp = R_i_inv * (T_B_W_j.translation() - T_B_W_i.translation() - v_i.clone() * self.preint.dt 
             - 0.5 * g_w * self.preint.dt * self.preint.dt) - dp_corr;
         
         // Convert SO3Tangent to DVector
-        let residual_dR_vec: DVector<f64> = residual_dR.into();
+        let residual_dR_vec: DVector<f64> = residual_dR.clone().into();
         
         // Concatenate all residuals into a single fixed-size Vector9
         let mut residuals_fixed = na::SVector::<f64, 9>::zeros();
         residuals_fixed.rows_mut(0, 3).copy_from(&residual_dR_vec);
         residuals_fixed.rows_mut(3, 3).copy_from(&residual_dv);
         residuals_fixed.rows_mut(6, 3).copy_from(&residual_dp);
+
+        let residuals_whitened = self.preint.whiten_residual(&residuals_fixed);
+        let residuals = DVector::from_vec(residuals_whitened.as_slice().to_vec());
         
+        let dt = self.preint.dt;
+        let g_w = Vector3::new(0.0, 0.0, -9.81);
+        let a_v = v_j.clone() - v_i.clone() - g_w * dt;
+        let a_p = t_j - t_i - v_i.clone() * dt - 0.5 * g_w * dt * dt;
+
         let jacobian_matrix = if compute_jacobian {
-            // TODO: Implement Jacobian computation
-            Some(DMatrix::zeros(9, 32))
+            let Riw = R_i_inv; // 3x3
+            let A_v = Riw * a_v; // 3x1
+            let A_p = Riw * a_p; // 3x1
+
+            let mut J = na::SMatrix::<f64, 9, 26>::zeros();
+
+            // Convenience
+            let RiT = R_i.rotation_matrix().transpose();
+            let RjT = R_j.rotation_matrix().transpose();
+            
+            let r_dR: Vector3<f64> = Vector3::new(residual_dR.x(), residual_dR.y(), residual_dR.z());
+            let Jr_inv = right_jacobian_inv(&r_dR);
+
+            let d_rR_d_phii = -Jr_inv * (RjT * R_i.rotation_matrix());
+            let d_rR_d_phij = Jr_inv;
+
+            // Fill blocks
+            J.fixed_view_mut::<3,3>(0, 0).copy_from(&d_rR_d_phii); // phi_i
+            J.fixed_view_mut::<3,3>(0, 9).copy_from(&d_rR_d_phij); // phi_j
+
+            // Gyro bias block
+            let d_rR_d_bg = -Jr_inv * self.preint.Jr_bg;
+            J.fixed_view_mut::<3,3>(0, 18).copy_from(&d_rR_d_bg);
+
+            // === r_{Δv} rows [3..6) ===
+            let a_v = v_j.clone() - v_i.clone() - g_w * dt;
+            let d_rv_d_phii = skew_symmetric(&(RiT * a_v)); // (Ri^T a_v)^wedge  [file:1]
+            J.fixed_view_mut::<3,3>(3, 0).copy_from(&d_rv_d_phii);  // phi_i
+            J.fixed_view_mut::<3,3>(3, 6).copy_from(&(-RiT));       // v_i
+            J.fixed_view_mut::<3,3>(3, 15).copy_from(&RiT);         // v_j
+            J.fixed_view_mut::<3,3>(3, 18).copy_from(&(-self.preint.Jv_bg));   // bg_i
+            J.fixed_view_mut::<3,3>(3, 21).copy_from(&(-self.preint.Jv_ba));   // ba_i
+
+            // === r_{Δp} rows [6..9) ===
+            let a_p = t_j - t_i - v_i.clone() * dt - g_w * (0.5 * dt * dt);
+            let d_rp_d_phii = skew_symmetric(&(RiT * a_p)); // (Ri^T a_p)^wedge  [file:1]
+            J.fixed_view_mut::<3,3>(6, 0).copy_from(&d_rp_d_phii);          // phi_i
+            J.fixed_view_mut::<3,3>(6, 3).copy_from(&(-na::Matrix3::identity()));  // p_i
+            J.fixed_view_mut::<3,3>(6, 6).copy_from(&(-RiT * dt));          // v_i
+            J.fixed_view_mut::<3,3>(6, 12).copy_from(&(RiT * R_j.rotation_matrix()));          // p_j
+            J.fixed_view_mut::<3,3>(6, 18).copy_from(&(-self.preint.Jp_bg));           // bg_i
+            J.fixed_view_mut::<3,3>(6, 21).copy_from(&(-self.preint.Jp_ba));           // ba_i
+
+            Some(J)
         } else {
             None
         };
 
-        let residuals_whitened = self.preint.whiten_residual(&residuals_fixed);
-        let residuals = DVector::from_vec(residuals_whitened.as_slice().to_vec());
-
         let jacobian_matrix = if let Some(jac) = jacobian_matrix {
-            // Convert DMatrix to SMatrix<f64, 9, 32> for whitening
-            let jac_static = na::SMatrix::<f64, 9, 32>::from_iterator(jac.iter().cloned());
+            // Convert DMatrix to SMatrix<f64, 9, 26> for whitening
+            let jac_static = na::SMatrix::<f64, 9, 26>::from_iterator(jac.iter().cloned());
             let jacobian_matrix_whitened = self.preint.whiten_jacobian(&jac_static);
             // Convert back to DMatrix
-            Some(DMatrix::from_iterator(9, 32, jacobian_matrix_whitened.iter().cloned()))
+            Some(DMatrix::from_iterator(9, 26, jacobian_matrix_whitened.iter().cloned()))
         } else {
             None
         };
@@ -677,6 +771,6 @@ impl Factor for IMUFactor {
     }
 
     fn get_dimension(&self) -> usize {
-        10 // 3 for delta position, 3 for delta velocity, 4 for delta orientation (quaternion)
+        26 // 3 for delta position, 3 for delta velocity, 4 for delta orientation (quaternion)
     }
 }
