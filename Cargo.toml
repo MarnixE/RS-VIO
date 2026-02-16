@@ -20,3 +20,4 @@ rayon = "1.11.0"
 camera-intrinsic-model = "0.7.2"
 apex-solver = { git = "https://github.com/amin-abouee/apex-solver", branch = "main" } # TODO change when official release includes the Schur complement methods
 faer = "0.23.2"
+approx = "0.5.0"

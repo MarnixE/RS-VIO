@@ -5,6 +5,7 @@ use imageproc::noise;
 use nalgebra::{self as na, Cholesky};
 use apex_solver::manifold::{LieGroup, so3::SO3};
 
+type Mat6 = na::SMatrix<f64, 6, 6>;
 type Mat9 = na::SMatrix<f64, 9, 9>;
 type Vec9 = na::SVector<f64, 9>;
 
@@ -28,6 +29,7 @@ pub struct PreInt {
     pub accel_random_walk: na::Vector3<f64>,
 
     pub inv_chol: Mat9,
+    pub inv_chol_bias: Mat6,
 }
 
 impl fmt::Debug for PreInt {
@@ -64,12 +66,21 @@ impl PreInt {
         self.inv_chol = W.clone();
     }
 
-    pub fn whiten_residual(&self, r: &Vec9) -> Vec9 {
+    pub fn whiten_residual_9(&self, r: &Vec9) -> Vec9 {
         self.inv_chol * r
     }
+     
+    pub fn whiten_residual_6(&self, r: &na::SVector<f64, 6>) -> na::SVector<f64, 6> {
+        self.inv_chol_bias * r
+    }
 
-    pub fn whiten_jacobian<const N: usize>(&self, J: &na::SMatrix<f64, 9, N>) -> na::SMatrix<f64, 9, N> {
-        self.inv_chol * J
+    pub fn whiten_jacobian_15<const N: usize>(&self, J: &na::SMatrix<f64, 15, N>) -> na::SMatrix<f64, 15, N> {
+        // self.inv_chol * J
+        let mat = na::stack![
+            self.inv_chol, 0;
+            0, self.inv_chol_bias
+        ];
+        mat * J
     }
 }
 
@@ -129,6 +140,7 @@ impl ImuPiecewiseIntegration {
         let mut Jp_ba = na::Matrix3::zeros();
 
         let mut cov_ik = na::SMatrix::<f64, 9, 9>::zeros(); 
+        let mut cov_eta = na::SMatrix::<f64, 6, 6>::zeros();
 
         // let bias_g = biases.rows(0, 3);
         // let bias_a = biases.rows(3, 3);
@@ -159,7 +171,7 @@ impl ImuPiecewiseIntegration {
             let A = self.construct_A(&dR_kkp1, &dR_ik, &acc_unbiased, dt);
             let B = self.construct_B(&J_r, &dR_ik, dt);
             
-            let cov_eta = self.cov_eta(dt); // Assuming isotropic noise for simplicity
+            cov_eta = self.cov_eta(dt); // Assuming isotropic noise for simplicity
             // print!("dt: {:.6}, cov_eta:\n{}", dt, cov_eta);
             cov_ik = A * cov_ik * A.transpose() + B * cov_eta * B.transpose(); // Propagate covariance
 
@@ -192,7 +204,7 @@ impl ImuPiecewiseIntegration {
             gyro_random_walk: self.gyro_random_walk,
             accel_random_walk: self.accel_random_walk,
             inv_chol: self.compute_inv_chol(&cov_ik), // Compute square root information matrix
-            // inv_chol: Mat9::zeros()
+            inv_chol_bias: self.inv_chol_bias(&cov_eta), // Compute square root information matrix for bias
         }
     }
 
@@ -268,6 +280,19 @@ impl ImuPiecewiseIntegration {
 
         // 2) Cholesky: Σ = L L^T
         let sigma_reg = sigma + Mat9::identity() * 1e-6;
+        let chol = na::Cholesky::new(sigma_reg);
+        let L = chol.as_ref().unwrap().l();
+
+        // 3) sqrt_info = L^{-1}
+        L.try_inverse().expect("Failed to invert L")
+    }
+
+    pub fn inv_chol_bias(&self, sigma: &na::SMatrix<f64, 6, 6>) -> na::SMatrix<f64, 6, 6> {
+        // 1) Symmetrize (numerical hygiene)
+        let sigma = 0.5 * (sigma + sigma.transpose());
+
+        // 2) Cholesky: Σ = L L^T
+        let sigma_reg = sigma + na::SMatrix::<f64, 6, 6>::identity() * 1e-6;
         let chol = na::Cholesky::new(sigma_reg);
         let L = chol.as_ref().unwrap().l();
 

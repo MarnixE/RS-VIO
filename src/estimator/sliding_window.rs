@@ -223,6 +223,9 @@ impl SlidingWindow {
             }
         }
 
+        let mut prev_kf_var = String::new();
+        let mut prev_vb_var = String::new();
+
         // Add factors
         for (id_frame, frame) in self.keyframes.iter().enumerate() {
             // Add KF poses
@@ -234,8 +237,22 @@ impl SlidingWindow {
             let se3_data = DVector::from_vec(vec![
                 t_B_W.x, t_B_W.y, t_B_W.z, q_B_W.w, q_B_W.i, q_B_W.j, q_B_W.k,
             ]);
+
             // println!("KF_{} initial pose: {:?}", frame.frame_id, se3_data);
             initial_values.insert(kf_var.clone(), (ManifoldType::SE3, se3_data.cast::<f64>()));
+
+            log::debug!("[SLIDING WINDOW] The accel bias is {:?}", frame.state.accel_bias);
+            log::debug!("[SLIDING WINDOW] The gyro bias is {:?}", frame.state.gyro_bias);
+
+            // Add velocity and bias variables for each keyframe
+            let v_bias = DVector::from_vec(vec![
+                frame.state.velocity.x, frame.state.velocity.y, frame.state.velocity.z,
+                frame.state.accel_bias.x, frame.state.accel_bias.y, frame.state.accel_bias.z,
+                frame.state.gyro_bias.x, frame.state.gyro_bias.y, frame.state.gyro_bias.z,
+            ]);
+
+            let vb_var = format!("vb_{}", id_frame);
+            initial_values.insert(vb_var.clone(), (ManifoldType::RN, v_bias.cast::<f64>()));
             
             // Process features from both cameras
             let camera_features = [
@@ -243,15 +260,26 @@ impl SlidingWindow {
                 (&frame.right_features, T_Cr_B),
             ];
             
-            if frame.imu_preintegration.is_some() {
+            if id_frame > 0 && frame.imu_preintegration.is_some() {
                 let imu_factor = ImuFactor::new(
                     frame.imu_preintegration.as_ref().unwrap().clone(),
                     frame.state.accel_bias,
                     frame.state.gyro_bias,
                 );
+                
+                let var_names: Vec<&str> = vec![
+                    &prev_kf_var, // Previous keyframe pose
+                    &prev_vb_var, // Previous keyframe velocity and biases
+                    &kf_var,     // Current keyframe pose
+                    &vb_var,     // Current keyframe velocity and biases
+                ];
 
-                problem.add_residual_block(&[&kf_var], Box::new(imu_factor), None);
+                problem.add_residual_block(&var_names, 
+                    Box::new(imu_factor), None);
             };
+            prev_kf_var = kf_var.clone();
+            prev_vb_var = vb_var.clone();
+
             
             for (features, T_C_B) in camera_features.iter() {
                 for feat in features.iter() {
@@ -500,6 +528,19 @@ impl SlidingWindow {
                     let mat = apex_solver::manifold::se3::SE3::from(value.to_vector()).matrix();
                     // println!("KF_{} optimized pose: {:?}", frame_id, mat);
                     self.keyframes.get_mut(frame_id as usize).unwrap().state.T_W_B = mat.try_inverse().expect("T_W_B should be invertible");
+                }
+            }
+            // Update velocity and bias if needed
+             else if let Some(frame_id_str) = var_name.strip_prefix("vb_") {
+                if let Ok(frame_id) = frame_id_str.parse::<i32>() {
+                    let vec = value.to_vector();
+                    let velocity = na::Vector3::new(vec[0], vec[1], vec[2]);
+                    let accel_bias = na::Vector3::new(vec[3], vec[4], vec[5]);
+                    let gyro_bias = na::Vector3::new(vec[6], vec[7], vec[8]);
+                    let frame = self.keyframes.get_mut(frame_id as usize).unwrap();
+                    frame.state.velocity = velocity;
+                    frame.state.accel_bias = accel_bias;
+                    frame.state.gyro_bias = gyro_bias;
                 }
             }
         });

@@ -265,7 +265,7 @@ impl<'a> Estimator<'a> {
             let imu_start = Instant::now();
             let imu_preint = self.piecewise_integration.integrate(
                 imu_data.unwrap_or(&[]),
-                &self.accel_biases.last().unwrap_or(&Vector3::zeros()),
+                &self.accel_biases.last().unwrap_or(&Vector3::zeros()), // TODO: safeguard against empty history
                 &self.gyro_biases.last().unwrap_or(&Vector3::zeros()),
             );
             current_frame.add_imu_preint(imu_preint);

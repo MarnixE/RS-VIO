@@ -1,9 +1,13 @@
 #[cfg(test)]
 mod tests {
+    use crate::optimization::factors::ImuFactor;
     use crate::optimization::observer::TerminalObserver;
     use crate::optimization::factors::PinholeProjectionFactor;
     use crate::optimization::factors::BundleAdjustmentFactorTranslationOnly;
     use crate::optimization::factors::BundleAdjustmentFactor;
+    use apex_solver::Factor;
+    use apex_solver::manifold::Tangent;
+    use apex_solver::manifold::so3;
     use apex_solver::optimizer::levenberg_marquardt::{LevenbergMarquardt, LevenbergMarquardtConfig};
     use apex_solver::linalg::LinearSolverType;
     use apex_solver::manifold::ManifoldType;
@@ -678,6 +682,395 @@ mod tests {
             println!("Warning: Optimization did not fully converge. Status: {:?}", opt_result.status);
         }
 
+    }
+
+    use approx::{assert_abs_diff_eq, assert_relative_eq};
+    use nalgebra::{DMatrix, Matrix3, Vector3, UnitQuaternion};
+    use crate::imu::piecewise_integration::PreInt;
+
+    // ---- Helpers: build parameter blocks in the format your Factor expects ----
+    fn pose7(t: Vector3<f64>, q_wxyz: [f64; 4]) -> DVector<f64> {
+        // (tx,ty,tz,qw,qx,qy,qz)
+        DVector::from_vec(vec![t.x, t.y, t.z, q_wxyz[0], q_wxyz[1], q_wxyz[2], q_wxyz[3]])
+    }
+
+    fn speedbias9(v: Vector3<f64>, ba: Vector3<f64>, bg: Vector3<f64>) -> DVector<f64> {
+        // (vx,vy,vz,bax,bay,baz,bgx,bgy,bgz)
+        DVector::from_vec(vec![
+            v.x, v.y, v.z,
+            ba.x, ba.y, ba.z,
+            bg.x, bg.y, bg.z
+        ])
+    }
+
+    fn quat_from_wxyz(q: [f64; 4]) -> UnitQuaternion<f64> {
+        // nalgebra uses (w, i, j, k)
+        UnitQuaternion::from_quaternion(na::Quaternion::new(q[0], q[1], q[2], q[3]))
+    }
+
+    fn quat_to_wxyz(q: &UnitQuaternion<f64>) -> [f64; 4] {
+        let qq = q.quaternion();
+        [qq.w, qq.i, qq.j, qq.k]
+    }
+
+     // ---- Define the 30D local perturbation mapping used by the Jacobian columns ----
+    //
+    // Columns [0..30) interpreted as:
+    //  0..3   : dphi_i
+    //  3..6   : dp_i   (applied as p_i <- p_i + R_i * dp_i; body-frame translation perturbation)
+    //  6..9   : dv_i
+    //  9..12  : dphi_j
+    //  12..15 : dp_j   (p_j <- p_j + R_j * dp_j)
+    //  15..18 : dv_j
+    //  18..21 : dbg_i
+    //  21..24 : dba_i
+    //  24..27 : dba_j
+    //  27..30 : dbg_j
+    //
+    // This matches the way your Jacobian blocks are *used* in the dv/dp rows (bg at col 18, ba at col 21),
+    // and it makes bias-residual rows easy to validate.
+    fn apply_local_update_30(
+        params: &Vec<na::DVector<f64>>,
+        dx: &na::SVector<f64, 30>,
+    ) -> Vec<na::DVector<f64>> {
+        assert_eq!(params.len(), 4);
+        assert_eq!(params[0].len(), 7);
+        assert_eq!(params[1].len(), 9);
+        assert_eq!(params[2].len(), 7);
+        assert_eq!(params[3].len(), 9);
+
+        // New column layout (must match ImuFactor::linearize() fill order):
+        // i: dphi(0..3), dv(3..6), dp(6..9), dba(9..12), dbg(12..15)
+        // j: dphi(15..18), dv(18..21), dp(21..24), dba(24..27), dbg(27..30)
+        const PHI_I: usize = 0;
+        const V_I: usize   = 3;
+        const P_I: usize   = 6;
+        const BA_I: usize  = 9;
+        const BG_I: usize  = 12;
+
+        const PHI_J: usize = 15;
+        const V_J: usize   = 18;
+        const P_J: usize   = 21;
+        const BA_J: usize  = 24;
+        const BG_J: usize  = 27;
+
+        let mut out = params.clone();
+
+        // --- Pose update: [t(3), q(wxyz)(4)] with right perturbation ---
+        // R <- R * Exp(dphi)
+        // p <- p + R * dp   (dp is body-frame tangent translation)
+        let mut update_pose7_inplace = |pose7v: &mut na::DVector<f64>, dphi: na::Vector3<f64>, dp: na::Vector3<f64>| {
+            let t = na::Vector3::new(pose7v[0], pose7v[1], pose7v[2]);
+
+            let qw = pose7v[3];
+            let qx = pose7v[4];
+            let qy = pose7v[5];
+            let qz = pose7v[6];
+            let q = UnitQuaternion::from_quaternion(na::Quaternion::new(qw, qx, qy, qz));
+
+            // --- CHANGE START: dq from your so3::SO3::exp ---
+            let dR_tangent = so3::SO3Tangent::from_components(dphi[0], dphi[1], dphi[2]);
+            let dR= dR_tangent.exp(None);
+
+            // Convert SO3 -> Matrix3 (you must adapt this one method name to your SO3 API)
+            let Rm: na::Matrix3<f64> = dR.rotation_matrix(); // e.g. dR.matrix(), dR.as_matrix(), dR.rotmat(), etc.
+
+            // Matrix3 -> Rotation3 -> UnitQuaternion
+            let rot = na::Rotation3::from_matrix_unchecked(Rm);
+            let dq = UnitQuaternion::from_rotation_matrix(&rot);
+            // --- CHANGE END ---
+
+            // Right perturbation (keep consistent with your analytic convention)
+            let q_new = q * dq;
+
+            let R = q.to_rotation_matrix();
+            let t_new = t + R * dp;
+
+            let qq = q_new.quaternion();
+            pose7v[0] = t_new.x;
+            pose7v[1] = t_new.y;
+            pose7v[2] = t_new.z;
+            pose7v[3] = qq.w;
+            pose7v[4] = qq.i;
+            pose7v[5] = qq.j;
+            pose7v[6] = qq.k;
+        };
+
+
+        // pose i
+        update_pose7_inplace(
+            &mut out[0],
+            na::Vector3::new(dx[PHI_I], dx[PHI_I + 1], dx[PHI_I + 2]),
+            na::Vector3::new(dx[P_I],   dx[P_I   + 1], dx[P_I   + 2]),
+        );
+
+        // speedbias i: [v(3), ba(3), bg(3)] additive
+        out[1][0] += dx[V_I];     out[1][1] += dx[V_I + 1];     out[1][2] += dx[V_I + 2];
+        out[1][3] += dx[BA_I];    out[1][4] += dx[BA_I + 1];    out[1][5] += dx[BA_I + 2];
+        out[1][6] += dx[BG_I];    out[1][7] += dx[BG_I + 1];    out[1][8] += dx[BG_I + 2];
+
+        // pose j
+        update_pose7_inplace(
+            &mut out[2],
+            na::Vector3::new(dx[PHI_J], dx[PHI_J + 1], dx[PHI_J + 2]),
+            na::Vector3::new(dx[P_J],   dx[P_J   + 1], dx[P_J   + 2]),
+        );
+
+        // speedbias j: [v(3), ba(3), bg(3)] additive
+        out[3][0] += dx[V_J];     out[3][1] += dx[V_J + 1];     out[3][2] += dx[V_J + 2];
+        out[3][3] += dx[BA_J];    out[3][4] += dx[BA_J + 1];    out[3][5] += dx[BA_J + 2];
+        out[3][6] += dx[BG_J];    out[3][7] += dx[BG_J + 1];    out[3][8] += dx[BG_J + 2];
+
+        out
+    }
+
+
+    #[test]
+    fn imu_factor_residual_zero_when_preint_matches_state() {
+        let dt = 0.01;
+        let g = Vector3::new(0.0, 0.0, -9.81);
+
+        // Choose a simple state.
+        let qi = UnitQuaternion::identity();
+        let ri = qi.to_rotation_matrix();
+        let ti = Vector3::new(1.0, 2.0, 3.0);
+        let vi = Vector3::new(0.5, -0.2, 0.1);
+
+        // Keep biases constant and equal across i->j.
+        let bai = Vector3::new(0.01, -0.02, 0.03);
+        let bgi = Vector3::new(-0.001, 0.002, -0.003);
+        let baj = bai;
+        let bgj = bgi;
+
+        // Define j consistent with a "perfect" preintegrated measurement:
+        // residual_dv = Ri^T*(v_j - v_i + g*dt) - dv = 0  => dv = Ri^T*(...)
+        // residual_dp = Ri^T*(t_j - t_i - v_i*dt + 0.5*g*dt^2) - dp = 0 => dp = Ri^T*(...)
+        let vj = vi - g * dt; // so vj - vi + g*dt = 0 => dv must be 0
+        let tj = ti + vi * dt - 0.5 * g * dt * dt; // so translation residual is 0 with dp=0
+
+        // For rotation, choose Rj = Ri * dR, and set preint.dR = Ri^{-1}Rj.
+        let qj = qi;
+        let dR = so3::SO3::identity(); // must match your implementation
+
+        let preint = PreInt {
+            dt,
+            dR,
+            dv: Vector3::zeros(),
+            dp: Vector3::zeros(),
+            Jr_bg: Matrix3::zeros(),
+            Jv_bg: Matrix3::zeros(),
+            Jv_ba: Matrix3::zeros(),
+            Jp_bg: Matrix3::zeros(),
+            Jp_ba: Matrix3::zeros(),
+            inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
+            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            gyro_random_walk: Vector3::from_element(0.00),
+            accel_random_walk: Vector3::from_element(0.00), // no whitening
+        };
+
+        let factor = ImuFactor::new(preint, bai, bgi);
+
+        let params = vec![
+            pose7(ti, quat_to_wxyz(&qi)),
+            speedbias9(vi, bai, bgi),
+            pose7(tj, quat_to_wxyz(&qj)),
+            speedbias9(vj, baj, bgj),
+        ];
+
+        let (r, j) = factor.linearize(&params, true);
+        assert_eq!(r.len(), 15);
+        assert!(j.is_some());
+
+        // Residual should be ~0 (numerical eps).
+        for k in 0..15 {
+            assert_abs_diff_eq!(r[k], 0.0, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn imu_factor_whitening_scales_residual_and_jacobian_rows() {
+        // This test checks the same behavior as VINS-Mono's `sqrt_info * residual` and `sqrt_info * jacobian` [page:0].
+        let dt = 0.1;
+
+        let preint = PreInt {
+            dt,
+            dR: so3::SO3::identity(),
+            dv: Vector3::new(1.0, 2.0, 3.0),
+            dp: Vector3::new(4.0, 5.0, 6.0),
+            Jr_bg: Matrix3::zeros(),
+            Jv_bg: Matrix3::zeros(),
+            Jv_ba: Matrix3::zeros(),
+            Jp_bg: Matrix3::zeros(),
+            Jp_ba: Matrix3::zeros(),
+            inv_chol: na::SMatrix::<f64, 9, 9>::identity() * 2.0, // no whitening
+            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity() * 3.0,
+            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            gyro_random_walk: Vector3::from_element(0.00),
+            accel_random_walk: Vector3::from_element(0.00), // no whitening
+        };
+
+        let bias_a = Vector3::zeros();
+        let bias_g = Vector3::zeros();
+        let factor = ImuFactor::new(preint.clone(), bias_a, bias_g);
+
+        let qi = UnitQuaternion::identity();
+        let qj = UnitQuaternion::identity();
+
+        let params = vec![
+            pose7(Vector3::zeros(), quat_to_wxyz(&qi)),
+            speedbias9(Vector3::zeros(), Vector3::zeros(), Vector3::zeros()),
+            pose7(Vector3::zeros(), quat_to_wxyz(&qj)),
+            speedbias9(Vector3::zeros(), Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0)),
+        ];
+
+        let (r_wh, j_wh) = factor.linearize(&params, true);
+        let j_wh = j_wh.unwrap();
+
+        // Now compute the same residual with whitening disabled (w9=1,w6=1) and compare scaling.
+        let mut preint_un = preint.clone();
+        preint_un.inv_chol = na::SMatrix::<f64, 9, 9>::identity();
+        preint_un.inv_chol_bias = na::SMatrix::<f64, 6, 6>::identity();
+        let factor_un = ImuFactor::new(preint_un, bias_a, bias_g);
+        let (r_un, j_un) = factor_un.linearize(&params, true);
+        let j_un = j_un.unwrap();
+
+        // First 9 rows scaled by 2, last 6 rows scaled by 3.
+        for k in 0..9 {
+            assert_relative_eq!(r_wh[k], 2.0 * r_un[k], epsilon = 1e-10);
+        }
+        for k in 9..15 {
+            assert_relative_eq!(r_wh[k], 3.0 * r_un[k], epsilon = 1e-10);
+        }
+
+        // Same for Jacobian rows.
+        for row in 0..9 {
+            for col in 0..30 {
+                assert_relative_eq!(j_wh[(row, col)], 2.0 * j_un[(row, col)], epsilon = 1e-10);
+            }
+        }
+        for row in 9..15 {
+            for col in 0..30 {
+                assert_relative_eq!(j_wh[(row, col)], 3.0 * j_un[(row, col)], epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn imu_factor_jacobian_matches_finite_difference() {
+        // This is the test that will catch wrong column assignments/signs.
+        let dt = 0.02;
+        let preint = PreInt {
+            dt,
+            dR: so3::SO3::identity(),
+            dv: Vector3::new(0.1, -0.2, 0.05),
+            dp: Vector3::new(0.01, 0.02, -0.03),
+            Jr_bg: 0.01 * Matrix3::identity(),
+            Jv_bg: 0.02 * Matrix3::identity(),
+            Jv_ba: 0.03 * Matrix3::identity(),
+            Jp_bg: 0.04 * Matrix3::identity(),
+            Jp_ba: 0.05 * Matrix3::identity(),
+            inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
+            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            gyro_random_walk: Vector3::from_element(0.00),
+            accel_random_walk: Vector3::from_element(0.00), // no whitening
+        };
+
+        let bias_a = Vector3::new(0.01, -0.02, 0.03);
+        let bias_g = Vector3::new(-0.001, 0.002, -0.003);
+        let factor = ImuFactor::new(preint, bias_a, bias_g);
+
+        let qi = UnitQuaternion::from_scaled_axis(Vector3::new(0.02, -0.01, 0.03));
+        let qj = UnitQuaternion::from_scaled_axis(Vector3::new(-0.01, 0.04, 0.01));
+        let params = vec![
+            pose7(Vector3::new(1.0, 2.0, 3.0), quat_to_wxyz(&qi)),
+            speedbias9(
+                Vector3::new(0.5, -0.2, 0.1),
+                Vector3::new(0.02, 0.01, -0.03),
+                Vector3::new(-0.004, 0.003, 0.002),
+            ),
+            pose7(Vector3::new(1.1, 2.1, 2.9), quat_to_wxyz(&qj)),
+            speedbias9(
+                Vector3::new(0.45, -0.18, 0.12),
+                Vector3::new(0.021, 0.011, -0.031),
+                Vector3::new(-0.0045, 0.0032, 0.0019),
+            ),
+        ];
+
+        let (r0, j_opt) = factor.linearize(&params, true);
+        let j = j_opt.expect("jacobian must be returned");
+        assert_eq!(j.nrows(), 15);
+        assert_eq!(j.ncols(), 30);
+        assert_eq!(r0.len(), 15);
+
+        let eps = 1e-7;
+
+        for col in 0..30 {
+            let mut dxp = na::SVector::<f64, 30>::zeros();
+            dxp[col] = eps;
+            let dxm = -dxp;
+
+            let pp = apply_local_update_30(&params, &dxp);
+            let pm = apply_local_update_30(&params, &dxm);
+
+            let (rp, _) = factor.linearize(&pp, false);
+            let (rm, _) = factor.linearize(&pm, false);
+
+            let num = (rp - rm) * (0.5 / eps);
+
+            // Compare column to finite-difference (allow slightly looser tolerance for rotation components).
+            for row in 0..15 {
+                let tol = if row < 3 { 5e-5 } else { 5e-6 };
+                let diff = (j[(row, col)] - num[row]).abs();
+                assert!(
+                    diff <= tol,
+                    "Mismatch at (row={}, col={}): analytic={}, numeric={}, |diff|={}, tol={}",
+                    row,
+                    col,
+                    j[(row, col)],
+                    num[row],
+                    diff,
+                    tol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn imu_factor_compute_jacobian_flag_works() {
+        let preint = PreInt {
+            dt: 0.01,
+            dR: so3::SO3::identity(),
+            dv: Vector3::zeros(),
+            dp: Vector3::zeros(),
+            Jr_bg: Matrix3::zeros(),
+            Jv_bg: Matrix3::zeros(),
+            Jv_ba: Matrix3::zeros(),
+            Jp_bg: Matrix3::zeros(),
+            Jp_ba: Matrix3::zeros(),
+
+            inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
+            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            gyro_random_walk: Vector3::from_element(0.00),
+            accel_random_walk: Vector3::from_element(0.00), // no whitening
+        };
+        let factor = ImuFactor::new(preint, Vector3::zeros(), Vector3::zeros());
+
+        let qi = UnitQuaternion::identity();
+        let params = vec![
+            pose7(Vector3::zeros(), quat_to_wxyz(&qi)),
+            speedbias9(Vector3::zeros(), Vector3::zeros(), Vector3::zeros()),
+            pose7(Vector3::zeros(), quat_to_wxyz(&qi)),
+            speedbias9(Vector3::zeros(), Vector3::zeros(), Vector3::zeros()),
+        ];
+
+        let (_, j_none) = factor.linearize(&params, false);
+        assert!(j_none.is_none());
+
+        let (_, j_some) = factor.linearize(&params, true);
+        assert!(j_some.is_some());
     }
 }
 

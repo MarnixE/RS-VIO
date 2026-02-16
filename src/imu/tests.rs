@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn jacobian_wrt_accel_bias_matches_finite_difference() {
+    fn jacobian_wrt_bias_matches_finite_difference() {
         let dt = 0.005; // 200 hz in seconds
         let imu_slice = make_random_imu_slice(200, dt);
         let bias_a = na::Vector3::new(0.01, -0.02, 0.005);
@@ -173,6 +173,23 @@ mod tests {
             let fd_dp = (out2.dp - base.dp) / eps;
             let colp = base.Jp_ba.column(axis);
             assert!((fd_dp - colp).norm() < 1e-4, "Jp_ba col {} mismatch", axis);
+        }
+
+        for axis in 0..3 {
+            let mut bias_g2 = bias_g;
+            bias_g2[axis] += eps;
+
+            let out2 = integrator.integrate(&imu_slice, &bias_a, &bias_g2);
+
+            let fd_dv = (out2.dv - base.dv) / eps;
+            let col = base.Jv_bg.column(axis);
+
+            println!("Finite difference dv wrt bias_g[{}]: {:?}", axis, fd_dv);
+            assert!((fd_dv - col).norm() < 1e-4, "Jv_bg col {} mismatch", axis);
+
+            let fd_dp = (out2.dp - base.dp) / eps;
+            let colp = base.Jp_bg.column(axis);
+            assert!((fd_dp - colp).norm() < 1e-4, "Jp_bg col {} mismatch", axis);
         }
     }
 }

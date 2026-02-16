@@ -9268,6 +9268,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apex-solver",
+ "approx",
  "camera-intrinsic-model",
  "clap",
  "env_logger",
