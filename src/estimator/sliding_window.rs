@@ -241,9 +241,6 @@ impl SlidingWindow {
             // println!("KF_{} initial pose: {:?}", frame.frame_id, se3_data);
             initial_values.insert(kf_var.clone(), (ManifoldType::SE3, se3_data.cast::<f64>()));
 
-            log::debug!("[SLIDING WINDOW] The accel bias is {:?}", frame.state.accel_bias);
-            log::debug!("[SLIDING WINDOW] The gyro bias is {:?}", frame.state.gyro_bias);
-
             // Add velocity and bias variables for each keyframe
             let v_bias = DVector::from_vec(vec![
                 frame.state.velocity.x, frame.state.velocity.y, frame.state.velocity.z,
@@ -273,9 +270,9 @@ impl SlidingWindow {
                     &kf_var,     // Current keyframe pose
                     &vb_var,     // Current keyframe velocity and biases
                 ];
-
+                let huber_loss = HuberLoss::new(2.0).unwrap();
                 problem.add_residual_block(&var_names, 
-                    Box::new(imu_factor), None);
+                    Box::new(imu_factor), Some(Box::new(huber_loss)));
             };
             prev_kf_var = kf_var.clone();
             prev_vb_var = vb_var.clone();

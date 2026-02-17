@@ -647,9 +647,9 @@ impl Factor for ImuFactor {
     ) -> (DVector<f64>, Option<DMatrix<f64>>) {
         assert_eq!(params.len(), 4, "ImuFactor requires 4 parameter vectors");
         assert_eq!(params[0].len(), 7, "System pose must have 7 parameters (tx_i, ty_i, tz_i, qw_i, qx_i, qy_i, qz_i)");
-        assert_eq!(params[1].len(), 9, "System pose must have 9 parameters (vx_i, vy_i, vz_i, bax_i, bay_i, baz_i, bgx_i, bgy_i, bgz_i)");
+        assert_eq!(params[1].len(), 9, "System vel + bias must have 9 parameters (vx_i, vy_i, vz_i, bax_i, bay_i, baz_i, bgx_i, bgy_i, bgz_i)");
         assert_eq!(params[2].len(), 7, "System pose must have 7 parameters (tx_j, ty_j, tz_j, qw_j, qx_j, qy_j, qz_j)");
-        assert_eq!(params[3].len(), 9, "System pose must have 9 parameters (vx_j, vy_j, vz_j, bax_j, bay_j, baz_j, bgx_j, bgy_j, bgz_j)");
+        assert_eq!(params[3].len(), 9, "System vel + bias must have 9 parameters (vx_j, vy_j, vz_j, bax_j, bay_j, baz_j, bgx_j, bgy_j, bgz_j)");
         
         let T_B_W_i = se3::SE3::from(params[0].rows(0, 7).clone_owned());
         let T_B_W_j = se3::SE3::from(params[2].rows(0, 7).clone_owned());
@@ -660,8 +660,10 @@ impl Factor for ImuFactor {
         let bg_i = params[1].rows(6, 3).clone_owned();
         let bg_j = params[3].rows(6, 3).clone_owned();
 
-        let db_g = bg_i.clone() - self.bias_g;
-        let db_a = ba_i.clone() - self.bias_a;
+        let db_a = ba_j.clone() - self.bias_a;
+        let db_g = bg_j.clone() - self.bias_g;
+
+        let g_w = Vector3::new(0.0, 0.0, 9.81);
         
         let R_i = T_B_W_i.rotation_so3();
         let R_j = T_B_W_j.rotation_so3();
@@ -676,26 +678,47 @@ impl Factor for ImuFactor {
             None,
             None
         );
+        // Residual w.r.t. velocity and position
         let dv_corr = self.preint.dv + self.preint.Jv_bg * db_g.clone() + self.preint.Jv_ba * db_a.clone();
         let dp_corr = self.preint.dp + self.preint.Jp_bg * db_g + self.preint.Jp_ba * db_a;
-
+        
+        // Residual w.r.t. rotation
         let residual_dR = dR_corr.inverse(None)
             .compose(&R_i.inverse(None), None, None)
             .compose(&R_j, None, None).log(None);
 
-        let g_w = Vector3::new(0.0, 0.0, 9.81);
-        let R_i_inv: Matrix3<f64> = R_i.inverse(None).rotation_matrix().into();
-        let v_diff = Vector3::new(v_j[0] - v_i[0] - g_w.x * self.preint.dt,
-                                   v_j[1] - v_i[1] - g_w.y * self.preint.dt,
-                                   v_j[2] - v_i[2] - g_w.z * self.preint.dt);
-        let residual_dv = R_i_inv * v_diff - dv_corr - g_w * self.preint.dt;
-        let residual_dp = R_i_inv * (T_B_W_j.translation() - T_B_W_i.translation() - v_i.clone() * self.preint.dt 
-            - 0.5 * g_w * self.preint.dt * self.preint.dt) - dp_corr;
-        let residual_bg = bg_j  - bg_i;
-        let residual_ba = ba_j  - ba_i;
+        // let R_i_inv: Matrix3<f64> = R_i.inverse(None).rotation_matrix().into();
+        let RiT = R_i.rotation_matrix().transpose();
+        // let v_diff = Vector3::new(v_j[0] - v_i[0] - g_w.x * self.preint.dt,
+        //                            v_j[1] - v_i[1] - g_w.y * self.preint.dt,
+        //                            v_j[2] - v_i[2] - g_w.z * self.preint.dt);
+        let v_diff = v_j.clone() - v_i.clone() - g_w.clone() * self.preint.dt;
+        let pred_dv = RiT * v_diff; // = R_i^T (v_j - v_i - g dt)
+        // log::info!("||pred_dv|| = {}", pred_dv.norm());
+        // log::info!("||dv_corr|| = {}", dv_corr.norm());
+        // log::info!("||pred_dv - dv_corr|| = {}", (pred_dv - dv_corr.clone()).norm());
+        // log::info!("dt = {}", self.preint.dt);
+        let residual_dv = RiT * v_diff - dv_corr;
+        let residual_dp = RiT * (T_B_W_j.translation() - T_B_W_i.translation() - v_i.clone() * self.preint.dt 
+            - 0.5 * g_w.clone() * self.preint.dt * self.preint.dt) - dp_corr;
+        // let residual_bg = bg_j  - bg_i;
+        // let residual_ba = ba_j  - ba_i;
+
+        let residual_b: na::SVector<f64, 6> = {
+            let mut v = na::SVector::<f64, 6>::zeros();
+            v.rows_mut(0, 3).copy_from(&(ba_j - ba_i));
+            v.rows_mut(3, 3).copy_from(&(bg_j - bg_i));
+            v
+        };
         
         // Convert SO3Tangent to DVector
         let residual_dR_vec: DVector<f64> = residual_dR.clone().into();
+
+        // log::info!("r_dR norm {}", residual_dR_vec.norm());
+        // log::info!("r_dv norm {}", residual_dv.norm());
+        // log::info!("r_dp norm {}", residual_dp.norm());
+        // log::info!("r_ba norm {}", residual_b.norm());
+        // log::info!("r_bg norm {}", residual_bg.norm());
         
         // Concatenate all residuals into a single fixed-size Vector9
         let mut residuals_fixed = na::SVector::<f64, 9>::zeros();
@@ -704,10 +727,12 @@ impl Factor for ImuFactor {
         residuals_fixed.rows_mut(6, 3).copy_from(&residual_dp);
         let residuals_whitened = self.preint.whiten_residual_9(&residuals_fixed);
 
-        let mut residuals_bias = na::SVector::<f64, 6>::zeros();
-        residuals_bias.rows_mut(0, 3).copy_from(&residual_ba);
-        residuals_bias.rows_mut(3, 3).copy_from(&residual_bg);
-        let residuals_bias_whitened = self.preint.whiten_residual_6(&residuals_bias);
+        // let mut residuals_bias = na::SVector::<f64, 6>::zeros();
+        // residuals_bias.rows_mut(0, 3).copy_from(&residual_ba);
+        // residuals_bias.rows_mut(3, 3).copy_from(&residual_bg);
+        // let sigma  = self.preint.
+        // let residuals_bias_whitened = self.preint.whiten_bias_residual(&residuals_b);
+        let residuals_bias_whitened = self.preint.inv_chol_bias * residual_b * 0.00001;
 
         let mut residuals_whitened_combined: na::SVector<f64, 15> = na::SVector::<f64, 15>::zeros();
         residuals_whitened_combined.rows_mut(0, 9).copy_from(&residuals_whitened);
@@ -716,16 +741,15 @@ impl Factor for ImuFactor {
         let residuals = DVector::from_vec(residuals_whitened_combined.as_slice().to_vec());
         
         let dt = self.preint.dt;
-        let g_w = Vector3::new(0.0, 0.0, 9.81);
-        let a_v = v_j.clone() - v_i.clone() - g_w * dt;
-        let a_p = t_j - t_i - v_i.clone() * dt - 0.5 * g_w * dt * dt;
+        let a_v = v_j.clone() - v_i.clone() - g_w.clone() * dt;
+        let a_p = t_j - t_i - v_i.clone() * dt - 0.5 * g_w.clone() * dt * dt;
 
         // log::debug!("[Optimization]: dt {:?}", dt);
 
         let jacobian_matrix = if compute_jacobian {
-            let Riw = R_i_inv; // 3x3
-            let A_v = Riw * a_v; // 3x1
-            let A_p = Riw * a_p; // 3x1
+            let Ri_inv = R_i.rotation_matrix().try_inverse().unwrap(); // 3x3
+            let A_v = Ri_inv * a_v; // 3x1
+            let A_p = Ri_inv * a_p; // 3x1
 
             // State order R_i, v_i, t_i, ba_i, bg_i, R_j, v_j, t_j, ba_j, bg_j
             let mut J = na::SMatrix::<f64, 15, 30>::zeros();
@@ -737,22 +761,22 @@ impl Factor for ImuFactor {
             let r_dR: Vector3<f64> = Vector3::new(residual_dR.x(), residual_dR.y(), residual_dR.z());
             let Jr_inv = right_jacobian_inv(&r_dR);
 
-            let d_rR_d_phi_i = Jr_inv * (RjT * R_i.rotation_matrix());
+            let d_rR_d_phi_i = -Jr_inv * (RjT * R_i.rotation_matrix());
             let d_rR_d_phi_j = Jr_inv;
 
             // Fill blocks
-            J.fixed_view_mut::<3,3>(0, 0).copy_from(&-d_rR_d_phi_i); // phi_i
+            J.fixed_view_mut::<3,3>(0, 0).copy_from(&d_rR_d_phi_i); // phi_i
             J.fixed_view_mut::<3,3>(0, 15).copy_from(&d_rR_d_phi_j); // phi_j
 
             // Gyro bias block
             // let temp = residual_dR.exp(None);
-            // let J_br = na::Matrix3::identity() - 0.5 * skew_symmetric(&r_dR) 
-            //     + 1.0 / 12.0 * skew_symmetric(&r_dR) * skew_symmetric(&r_dR); // Jr for right perturbation
-            let d_rR_d_bg = Jr_inv * residual_dR.exp(None).rotation_matrix().transpose() * self.preint.Jr_bg;
+            let J_br = na::Matrix3::identity() - 0.5 * skew_symmetric(&r_dR) 
+                + 1.0 / 12.0 * skew_symmetric(&r_dR) * skew_symmetric(&r_dR); // Jr for right perturbation
+            let d_rR_d_bg = Jr_inv * residual_dR.exp(None).rotation_matrix().transpose() * J_br * self.preint.Jr_bg;
             J.fixed_view_mut::<3,3>(0, 12).copy_from(&(-d_rR_d_bg));
 
             // === Velocity rows [3..6) ===
-            let a_v = v_j.clone() - v_i.clone() - g_w * dt;
+            let a_v = v_j.clone() - v_i.clone() - g_w.clone() * dt;
             let d_rv_d_phi_i = skew_symmetric(&(RiT * a_v)); // (Ri^T a_v)^wedge  [file:1]
             J.fixed_view_mut::<3,3>(3, 0).copy_from(&d_rv_d_phi_i);  // phi_i
             J.fixed_view_mut::<3,3>(3, 3).copy_from(&(-RiT));       // v_i
@@ -761,12 +785,14 @@ impl Factor for ImuFactor {
             J.fixed_view_mut::<3,3>(3, 12).copy_from(&(-self.preint.Jv_bg));   // bg_i
 
             // === Translation rows [6..9) ===
-            let a_p = t_j - t_i - v_i.clone() * dt - g_w * (0.5 * dt * dt);
+            let a_p = t_j - t_i - v_i.clone() * dt - g_w.clone() * (0.5 * dt * dt);
             let d_rp_d_phi_i = skew_symmetric(&(RiT * a_p)); // (Ri^T a_p)^wedge  [file:1]
             J.fixed_view_mut::<3,3>(6, 0).copy_from(&d_rp_d_phi_i);          // phi_i
             J.fixed_view_mut::<3,3>(6, 3).copy_from(&(-RiT * dt));          // v_i
-            J.fixed_view_mut::<3,3>(6, 6).copy_from(&(-na::Matrix3::identity()));  // p_i
-            J.fixed_view_mut::<3,3>(6, 21).copy_from(&(RiT * R_j.rotation_matrix()));          // p_j
+            // J.fixed_view_mut::<3,3>(6, 6).copy_from(&(-na::Matrix3::identity()));  // p_i
+            J.fixed_view_mut::<3,3>(6, 6).copy_from(&(-RiT));
+            J.fixed_view_mut::<3,3>(6, 21).copy_from(&(RiT));          // p_j
+            // J.fixed_view_mut::<3,3>(6, 21).copy_from(&(RiT * R_j.rotation_matrix()));          // p_j
             J.fixed_view_mut::<3,3>(6, 9).copy_from(&(-self.preint.Jp_ba));           // ba_i
             J.fixed_view_mut::<3,3>(6, 12).copy_from(&(-self.preint.Jp_bg));           // bg_i
             // === Bias rows [9..15) ===
@@ -785,6 +811,9 @@ impl Factor for ImuFactor {
             let jac_static = na::SMatrix::<f64, 15, 30>::from_iterator(jac.iter().cloned());
             let jacobian_matrix_whitened = self.preint.whiten_jacobian_15(&jac_static);
             // Convert back to DMatrix
+            if jacobian_matrix_whitened.max() > 1e8 || jacobian_matrix_whitened.min() < -1e8 {
+                log::error!("Numerical unstable in preintegration whitening, large values in whitened jacobian: max {}, min {}", jacobian_matrix_whitened.max(), jacobian_matrix_whitened.min());
+            }
             Some(DMatrix::from_iterator(15, 30, jacobian_matrix_whitened.iter().cloned()))
         } else {
             None

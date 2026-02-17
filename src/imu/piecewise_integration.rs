@@ -5,9 +5,9 @@ use imageproc::noise;
 use nalgebra::{self as na, Cholesky};
 use apex_solver::manifold::{LieGroup, so3::SO3};
 
-type Mat6 = na::SMatrix<f64, 6, 6>;
-type Mat9 = na::SMatrix<f64, 9, 9>;
-type Vec9 = na::SVector<f64, 9>;
+// type Matrix6 = na::SMatrix<f64, 6, 6>;
+type Matrix9 = na::SMatrix<f64, 9, 9>;
+type Vector9 = na::SVector<f64, 9>;
 
 #[derive(Clone)]
 #[allow(non_snake_case, dead_code)]
@@ -15,7 +15,7 @@ pub struct PreInt {
     pub dR: SO3,
     pub dv: na::Vector3<f64>,
     pub dp: na::Vector3<f64>,
-    pub cov: Mat9,
+    pub cov: Matrix9,
     pub dt: f64,
     // pub bias_g: na::Vector3<f64>,
     // pub bias_a: na::Vector3<f64>,
@@ -25,11 +25,11 @@ pub struct PreInt {
     pub Jp_bg: na::Matrix3<f64>,
     pub Jp_ba: na::Matrix3<f64>,
 
-    pub gyro_random_walk: na::Vector3<f64>,
-    pub accel_random_walk: na::Vector3<f64>,
+    // pub gyro_random_walk: na::Matrix3<f64>,
+    // pub accel_random_walk: na::Matrix3<f64>,
 
-    pub inv_chol: Mat9,
-    pub inv_chol_bias: Mat6,
+    pub inv_chol: Matrix9,
+    pub inv_chol_bias: na::Matrix6<f64>,
 }
 
 impl fmt::Debug for PreInt {
@@ -41,8 +41,8 @@ impl fmt::Debug for PreInt {
             .field("dt", &self.dt)
             // .field("bias_g", &self.bias_g)
             // .field("bias_a", &self.bias_a)
-            .field("gyro_random_walk", &self.gyro_random_walk)
-            .field("accel_random_walk", &self.accel_random_walk)
+            // .field("gyro_random_walk", &self.gyro_random_walk)
+            // .field("accel_random_walk", &self.accel_random_walk)
             .finish()
     }
 }
@@ -66,12 +66,8 @@ impl PreInt {
         self.inv_chol = W.clone();
     }
 
-    pub fn whiten_residual_9(&self, r: &Vec9) -> Vec9 {
+    pub fn whiten_residual_9(&self, r: &Vector9) -> Vector9 {
         self.inv_chol * r
-    }
-     
-    pub fn whiten_residual_6(&self, r: &na::SVector<f64, 6>) -> na::SVector<f64, 6> {
-        self.inv_chol_bias * r
     }
 
     pub fn whiten_jacobian_15<const N: usize>(&self, J: &na::SMatrix<f64, 15, N>) -> na::SMatrix<f64, 15, N> {
@@ -90,8 +86,8 @@ pub struct ImuPiecewiseIntegration {
     T_BS: na::Matrix4<f64>,
     accel_noise_density: f64,
     gyro_noise_density: f64,
-    accel_random_walk: na::Vector3<f64>,
-    gyro_random_walk: na::Vector3<f64>,
+    accel_random_walk: na::Matrix3<f64>,
+    gyro_random_walk: na::Matrix3<f64>,
     // preintegrated_noise: na::SVector<f64, 9>,
 }
 
@@ -105,8 +101,8 @@ impl ImuPiecewiseIntegration {
             T_BS: nalgebra::Matrix4::identity(),
             accel_noise_density: 1.0,
             gyro_noise_density: 1.0,
-            accel_random_walk: na::Vector3::zeros(),
-            gyro_random_walk: na::Vector3::zeros(),
+            accel_random_walk: na::Matrix3::zeros(),
+            gyro_random_walk: na::Matrix3::zeros(),
             // preintegrated_noise: na::SVector::<f64, 9>::zeros(),
         }
     }
@@ -117,8 +113,8 @@ impl ImuPiecewiseIntegration {
             T_BS: nalgebra::Matrix4::from_row_slice(&config.T_BS.data),
             accel_noise_density: config.accel_noise_density,
             gyro_noise_density: config.gyro_noise_density,
-            accel_random_walk: na::Vector3::from_element(config.accel_random_walk),
-            gyro_random_walk: na::Vector3::from_element(config.gyro_random_walk),
+            accel_random_walk: na::Matrix3::identity() * config.accel_random_walk.powi(2),
+            gyro_random_walk: na::Matrix3::identity() * config.gyro_random_walk.powi(2),
             // preintegrated_noise: na::SVector::<f64, 9>::from_element(1.0),
         }
     }
@@ -140,7 +136,6 @@ impl ImuPiecewiseIntegration {
         let mut Jp_ba = na::Matrix3::zeros();
 
         let mut cov_ik = na::SMatrix::<f64, 9, 9>::zeros(); 
-        let mut cov_eta = na::SMatrix::<f64, 6, 6>::zeros();
 
         // let bias_g = biases.rows(0, 3);
         // let bias_a = biases.rows(3, 3);
@@ -155,9 +150,10 @@ impl ImuPiecewiseIntegration {
                 continue;
             }
             prev_ts = ts;
-
-            let omega_unbiased = imu.gyro - bias_g;
+        
+            
             let acc_unbiased = imu.accel - bias_a;
+            let omega_unbiased = imu.gyro - bias_g;
 
             let dphi = omega_unbiased  * dt; // Angular increment
             let dR_kkp1 = SO3::from_scaled_axis(dphi);
@@ -171,7 +167,7 @@ impl ImuPiecewiseIntegration {
             let A = self.construct_A(&dR_kkp1, &dR_ik, &acc_unbiased, dt);
             let B = self.construct_B(&J_r, &dR_ik, dt);
             
-            cov_eta = self.cov_eta(dt); // Assuming isotropic noise for simplicity
+            let cov_eta = self.cov_eta(dt); // Assuming isotropic noise for simplicity
             // print!("dt: {:.6}, cov_eta:\n{}", dt, cov_eta);
             cov_ik = A * cov_ik * A.transpose() + B * cov_eta * B.transpose(); // Propagate covariance
 
@@ -187,13 +183,41 @@ impl ImuPiecewiseIntegration {
 
             dR_ik = SO3::from_quaternion(dR_ik.quaternion() * dR_kkp1.quaternion());
         }
+        
+        let dt_step = ts - first_ts;
+
+        if dt_step <= 0.0 {
+            log::warn!("Invalid time interval for preintegration: dt_step = {}", dt_step);
+            return PreInt {
+                dR: SO3::identity(),
+                dv: na::Vector3::zeros(),
+                dp: na::Vector3::zeros(),
+                cov: Matrix9::identity() * 1e-6, // Small covariance to avoid singularity
+                dt: dt_step,
+                Jr_bg: na::Matrix3::zeros(),
+                Jv_bg: na::Matrix3::zeros(),
+                Jv_ba: na::Matrix3::zeros(),
+                Jp_bg: na::Matrix3::zeros(),
+                Jp_ba: na::Matrix3::zeros(),
+                // gyro_random_walk: self.gyro_random_walk,
+                // accel_random_walk: self.accel_random_walk,
+                inv_chol: Matrix9::identity(), // Identity since covariance is near zero
+                inv_chol_bias: na::Matrix6::identity(), // Identity for bias as well
+            };
+        }
+
+        let sigma = self.bias_rw_cov(dt_step, 
+            self.gyro_random_walk, 
+            self.accel_random_walk,
+        );
+
 
         PreInt {
             dR: dR_ik,
             dv: dv_ik,
             dp: dp_ik,
             cov: cov_ik,
-            dt: (ts - first_ts), // Total time from the first to the last IMU measurement
+            dt: dt_step.clone(), // Total time from the first to the last IMU measurement
             // bias_g,
             // bias_a,
             Jr_bg: Jr_bg, 
@@ -201,10 +225,10 @@ impl ImuPiecewiseIntegration {
             Jv_ba: Jv_ba,
             Jp_bg: Jp_bg, 
             Jp_ba: Jp_ba, 
-            gyro_random_walk: self.gyro_random_walk,
-            accel_random_walk: self.accel_random_walk,
+            // gyro_random_walk: self.gyro_random_walk,
+            // accel_random_walk: self.accel_random_walk,
             inv_chol: self.compute_inv_chol(&cov_ik), // Compute square root information matrix
-            inv_chol_bias: self.inv_chol_bias(&cov_eta), // Compute square root information matrix for bias
+            inv_chol_bias: self.inv_chol_bias(&sigma), // Identity for bias as well
         }
     }
 
@@ -274,12 +298,12 @@ impl ImuPiecewiseIntegration {
             0, Qa]
     }
 
-    pub fn compute_inv_chol(&self, sigma: &Mat9) -> Mat9 {
+    pub fn compute_inv_chol(&self, sigma: &Matrix9) -> Matrix9 {
         // 1) Symmetrize (numerical hygiene)
         let sigma = 0.5 * (sigma + sigma.transpose());
 
         // 2) Cholesky: Σ = L L^T
-        let sigma_reg = sigma + Mat9::identity() * 1e-6;
+        let sigma_reg = sigma + Matrix9::identity() * 1e-6;
         let chol = na::Cholesky::new(sigma_reg);
         let L = chol.as_ref().unwrap().l();
 
@@ -298,6 +322,14 @@ impl ImuPiecewiseIntegration {
 
         // 3) sqrt_info = L^{-1}
         L.try_inverse().expect("Failed to invert L")
+    }
+
+    fn bias_rw_cov(&self, dt: f64, q_bg: na::Matrix3<f64>, q_ba: na::Matrix3<f64>) -> na::Matrix6<f64> {
+        // Cov = blockdiag( dt*Q_bg, dt*Q_ba )
+        let mut sigma = na::Matrix6::<f64>::zeros();
+        sigma.fixed_view_mut::<3,3>(0,0).copy_from(&(dt * q_ba));
+        sigma.fixed_view_mut::<3,3>(3,3).copy_from(&(dt * q_bg));
+        sigma
     }
 
 }

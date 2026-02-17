@@ -185,6 +185,12 @@ impl<'a> Estimator<'a> {
         let remaped = camera_intrinsic_model::remap(&img_l8, &xmap, &ymap);
         remaped.save("remaped0.png").unwrap();
         */
+        log::info!(
+            "[Estimator] Last velocity: {:?}, Last accel bias: {:?}, Last gyro bias: {:?}",
+            self.velocities.last(),
+            self.accel_biases.last(),
+            self.gyro_biases.last()
+        );
 
         // Create frame (images are not stored, only features will be added)
         let mut current_frame = Frame::from_stereo_images(
@@ -268,6 +274,7 @@ impl<'a> Estimator<'a> {
                 &self.accel_biases.last().unwrap_or(&Vector3::zeros()), // TODO: safeguard against empty history
                 &self.gyro_biases.last().unwrap_or(&Vector3::zeros()),
             );
+            
             current_frame.add_imu_preint(imu_preint);
             imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -393,10 +400,10 @@ impl<'a> Estimator<'a> {
             self.velocities.push(vel);
 
             let ba = self.sliding_window.get_keyframe_accel_bias().first().unwrap().clone();
-            self.velocities.push(ba);
+            self.accel_biases.push(ba);
 
             let bg = self.sliding_window.get_keyframe_gyro_bias().first().unwrap().clone();
-            self.velocities.push(bg);
+            self.gyro_biases.push(bg);
             
             // Display trajectory as a continuous 3D path
             v.log_trajectory(&self.trajectory, "trajectory/path");
