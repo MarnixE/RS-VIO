@@ -264,7 +264,8 @@ impl Factor for BundleAdjustmentFactorTranslationOnly {
         } else {
             None
         };
-
+        log::warn!("Residuals BA factor: {:?}", residuals);
+        log::warn!("Jacobian BA factor: {:?}", jacobian_matrix);
         (residuals, jacobian_matrix)
     }
 
@@ -290,17 +291,22 @@ pub struct BundleAdjustmentFactor {
 
     /// Fixed pose T_B_W (SE3 transform from W to B) if provided, None if pose is optimized
     pub fixed_pose: Option<Matrix4<f64>>,
+
+    // The sqrt information matrix for the residuals, if using a robust loss. If None, assume identity (no weighting).
+    pub sqrt_info : Option<na::Matrix2<f64>>,
 }
 
 impl BundleAdjustmentFactor {
     pub fn new(
         observation: Vector2<f64>,
         T_C_B: Matrix4<f64>,
+        sqrt_info: Option<na::Matrix2<f64>>,
     ) -> Self {
         Self {
             observation,
             T_C_B,
             fixed_pose: None,
+            sqrt_info: sqrt_info,
         }
     }
 
@@ -357,9 +363,6 @@ impl Factor for BundleAdjustmentFactor {
     ) -> (DVector<f64>, Option<DMatrix<f64>>) {
         // Extract 3D point in world frame
         let p_W = Vector3::new(params[0][0], params[0][1], params[0][2]);
-        
-
-
 
         // Extract T_B_W (SE3 transform from W to B)
         let (R_B_W, t_B_W) = if let Some(T_B_W) = self.fixed_pose {
@@ -446,8 +449,20 @@ impl Factor for BundleAdjustmentFactor {
         } else {
             None
         };
+        let residuals_whitened = if self.sqrt_info.is_some() {
+            DVector::from_vec((self.sqrt_info.unwrap() * residuals).as_slice().to_vec())
+        } else {
+            residuals
+        };
 
-        (residuals, jacobian_matrix)
+        let jacobian_whitened = if let Some(sqrt_info) = self.sqrt_info {
+            let sqrt_info_dmat = DMatrix::from_fn(2, 2, |i, j| sqrt_info[(i, j)]);
+            jacobian_matrix.map(|jac| sqrt_info_dmat * jac)
+        } else {
+            jacobian_matrix
+        };
+
+        (residuals_whitened, jacobian_whitened)
     }
 
     fn get_dimension(&self) -> usize {
@@ -576,7 +591,8 @@ impl Factor for PnPFactor {
         } else {
             None
         };
-
+        // log::error!("Residuals PnP factor: {:?}", residuals);
+        // log::error!("Jacobian PnP factor: {:?}", jacobian_matrix);
         (residuals, jacobian_matrix)
     }
 
@@ -663,7 +679,7 @@ impl Factor for ImuFactor {
         let db_a = ba_j.clone() - self.bias_a;
         let db_g = bg_j.clone() - self.bias_g;
 
-        let g_w = Vector3::new(0.0, 0.0, 9.81);
+        let g_w = Vector3::new(0.0, 0.0, 9.81007);
         
         let R_i = T_B_W_i.rotation_so3();
         let R_j = T_B_W_j.rotation_so3();
@@ -725,17 +741,18 @@ impl Factor for ImuFactor {
         residuals_fixed.rows_mut(0, 3).copy_from(&residual_dR_vec);
         residuals_fixed.rows_mut(3, 3).copy_from(&residual_dv);
         residuals_fixed.rows_mut(6, 3).copy_from(&residual_dp);
-        let residuals_whitened = self.preint.whiten_residual_9(&residuals_fixed);
+        let residuals_whitened = self.preint.whiten_residual_9(&(residuals_fixed* 1e-8));
 
         // let mut residuals_bias = na::SVector::<f64, 6>::zeros();
         // residuals_bias.rows_mut(0, 3).copy_from(&residual_ba);
         // residuals_bias.rows_mut(3, 3).copy_from(&residual_bg);
         // let sigma  = self.preint.
         // let residuals_bias_whitened = self.preint.whiten_bias_residual(&residuals_b);
-        let residuals_bias_whitened = self.preint.inv_chol_bias * residual_b * 0.00001;
+        let residuals_bias_whitened = self.preint.inv_chol_bias * residual_b * 1e-8;
 
         let mut residuals_whitened_combined: na::SVector<f64, 15> = na::SVector::<f64, 15>::zeros();
         residuals_whitened_combined.rows_mut(0, 9).copy_from(&residuals_whitened);
+        // residuals_whitened_combined.rows_mut(0, 9).copy_from(&residuals_fixed);
         residuals_whitened_combined.rows_mut(9, 6).copy_from(&residuals_bias_whitened);
 
         let residuals = DVector::from_vec(residuals_whitened_combined.as_slice().to_vec());
@@ -809,16 +826,18 @@ impl Factor for ImuFactor {
         let jacobian_matrix = if let Some(jac) = jacobian_matrix {
             // Convert DMatrix to SMatrix<f64, 15, 30> for whitening
             let jac_static = na::SMatrix::<f64, 15, 30>::from_iterator(jac.iter().cloned());
-            let jacobian_matrix_whitened = self.preint.whiten_jacobian_15(&jac_static);
+            let jacobian_matrix_whitened = self.preint.whiten_jacobian_15(&(jac_static * 1e-8));
             // Convert back to DMatrix
             if jacobian_matrix_whitened.max() > 1e8 || jacobian_matrix_whitened.min() < -1e8 {
                 log::error!("Numerical unstable in preintegration whitening, large values in whitened jacobian: max {}, min {}", jacobian_matrix_whitened.max(), jacobian_matrix_whitened.min());
             }
             Some(DMatrix::from_iterator(15, 30, jacobian_matrix_whitened.iter().cloned()))
+            // Some(DMatrix::from_iterator(15, 30, jac_static.iter().cloned()))
         } else {
             None
         };
-        
+        // log::debug!("[Optimization]: Residuals after whitening: {:?}", residuals_whitened_combined);
+        // log::debug!("[Optimization]: Jacobians after whitening: {:?}", jacobian_matrix);
         (residuals, jacobian_matrix)
     }
 

@@ -269,7 +269,7 @@ impl<'a> Estimator<'a> {
         // Bundle adjustment
         if current_frame.is_keyframe {
             let imu_start = Instant::now();
-            let imu_preint = self.piecewise_integration.integrate(
+            let imu_preint = self.piecewise_integration.propagate(
                 imu_data.unwrap_or(&[]),
                 &self.accel_biases.last().unwrap_or(&Vector3::zeros()), // TODO: safeguard against empty history
                 &self.gyro_biases.last().unwrap_or(&Vector3::zeros()),

@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{datasets::{ImuData, config}, imu, types::Vector3};
 use imageproc::noise;
-use nalgebra::{self as na, Cholesky};
+use nalgebra::{self as na, Cholesky, SymmetricEigen};
 use apex_solver::manifold::{LieGroup, so3::SO3};
 
 // type Matrix6 = na::SMatrix<f64, 6, 6>;
@@ -30,6 +30,9 @@ pub struct PreInt {
 
     pub inv_chol: Matrix9,
     pub inv_chol_bias: na::Matrix6<f64>,
+
+    /// Buffers for repropagation
+    imu_buffer: Vec<ImuData>,
 }
 
 impl fmt::Debug for PreInt {
@@ -88,6 +91,7 @@ pub struct ImuPiecewiseIntegration {
     gyro_noise_density: f64,
     accel_random_walk: na::Matrix3<f64>,
     gyro_random_walk: na::Matrix3<f64>,
+    imu_buffer: Vec<ImuData>,
     // preintegrated_noise: na::SVector<f64, 9>,
 }
 
@@ -103,6 +107,7 @@ impl ImuPiecewiseIntegration {
             gyro_noise_density: 1.0,
             accel_random_walk: na::Matrix3::zeros(),
             gyro_random_walk: na::Matrix3::zeros(),
+            imu_buffer: Vec::new(),
             // preintegrated_noise: na::SVector::<f64, 9>::zeros(),
         }
     }
@@ -115,12 +120,14 @@ impl ImuPiecewiseIntegration {
             gyro_noise_density: config.gyro_noise_density,
             accel_random_walk: na::Matrix3::identity() * config.accel_random_walk.powi(2),
             gyro_random_walk: na::Matrix3::identity() * config.gyro_random_walk.powi(2),
+            imu_buffer: Vec::new(),
             // preintegrated_noise: na::SVector::<f64, 9>::from_element(1.0),
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn integrate(&mut self, imu_slice: &[ImuData], bias_a: &Vector3, bias_g: &Vector3) -> PreInt {
+    pub fn propagate(&mut self, imu_slice: &[ImuData], bias_a: &Vector3, bias_g: &Vector3) -> PreInt {
+        self.imu_buffer = imu_slice.to_vec(); // Store the IMU data for repropagation
         let mut prev_ts = imu_slice.first().map_or(0.0, |imu| imu.timestamp as f64 * 1e-9); // Initialize prev_timestamp to the timestamp of the first IMU measurement
         let first_ts = prev_ts.clone();
         let mut ts = 0.0;
@@ -150,8 +157,7 @@ impl ImuPiecewiseIntegration {
                 continue;
             }
             prev_ts = ts;
-        
-            
+
             let acc_unbiased = imu.accel - bias_a;
             let omega_unbiased = imu.gyro - bias_g;
 
@@ -168,7 +174,8 @@ impl ImuPiecewiseIntegration {
             let B = self.construct_B(&J_r, &dR_ik, dt);
             
             let cov_eta = self.cov_eta(dt); // Assuming isotropic noise for simplicity
-            // print!("dt: {:.6}, cov_eta:\n{}", dt, cov_eta);
+            // log::warn!("Cov eta: {:?}", cov_eta);
+            // log::warn!("Cov ik: {:?}", cov_ik);
             cov_ik = A * cov_ik * A.transpose() + B * cov_eta * B.transpose(); // Propagate covariance
 
             Jp_ba += Jv_ba * dt - 0.5 * dR_ik.rotation_matrix() * (dt*dt);
@@ -203,6 +210,7 @@ impl ImuPiecewiseIntegration {
                 // accel_random_walk: self.accel_random_walk,
                 inv_chol: Matrix9::identity(), // Identity since covariance is near zero
                 inv_chol_bias: na::Matrix6::identity(), // Identity for bias as well
+                imu_buffer: imu_slice.to_vec(), // Store the raw IMU data for potential repropagation
             };
         }
 
@@ -210,7 +218,6 @@ impl ImuPiecewiseIntegration {
             self.gyro_random_walk, 
             self.accel_random_walk,
         );
-
 
         PreInt {
             dR: dR_ik,
@@ -229,7 +236,15 @@ impl ImuPiecewiseIntegration {
             // accel_random_walk: self.accel_random_walk,
             inv_chol: self.compute_inv_chol(&cov_ik), // Compute square root information matrix
             inv_chol_bias: self.inv_chol_bias(&sigma), // Identity for bias as well
+            imu_buffer: imu_slice.to_vec(), // Store the raw IMU data for potential repropagation
         }
+    }
+
+    pub fn repropagate(&mut self, new_bias_a: &Vector3, new_bias_g: &Vector3) -> PreInt {
+        let imu_slice = self.imu_buffer.clone(); // Get the original IMU data slice
+        
+        // Re-run the propagate function with the stored IMU data and new biases
+        self.propagate(&imu_slice, new_bias_a, new_bias_g)
     }
 
     fn right_jacobian_so3(&self, phi: &na::Vector3<f64>) -> na::Matrix3<f64> {
@@ -324,7 +339,7 @@ impl ImuPiecewiseIntegration {
         L.try_inverse().expect("Failed to invert L")
     }
 
-    fn bias_rw_cov(&self, dt: f64, q_bg: na::Matrix3<f64>, q_ba: na::Matrix3<f64>) -> na::Matrix6<f64> {
+    fn bias_rw_cov(&self, dt: f64, q_ba: na::Matrix3<f64>, q_bg: na::Matrix3<f64>) -> na::Matrix6<f64> {
         // Cov = blockdiag( dt*Q_bg, dt*Q_ba )
         let mut sigma = na::Matrix6::<f64>::zeros();
         sigma.fixed_view_mut::<3,3>(0,0).copy_from(&(dt * q_ba));
