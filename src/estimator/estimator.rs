@@ -48,6 +48,8 @@ pub struct Estimator<'a> {
     // IMU biases
     gyro_biases: Vec<Vector3>,
     accel_biases: Vec<Vector3>,
+
+    imu_buffer: Vec<ImuData>, // Buffer to store incoming IMU data for preintegration
 }
 
 impl<'a> Estimator<'a> {
@@ -113,6 +115,7 @@ impl<'a> Estimator<'a> {
             velocities: Vec::new(),
             gyro_biases: Vec::new(),
             accel_biases: Vec::new(),
+            imu_buffer: Vec::new(),
         }
     }
 
@@ -125,6 +128,10 @@ impl<'a> Estimator<'a> {
         imu_data: Option<&[ImuData]>,
     ) -> Result<()> {
         let total_start_time = Instant::now();
+
+        if let Some(imu_data) = imu_data {
+            self.imu_buffer.extend_from_slice(imu_data);
+        }
 
         // New frame: update counters
         self.frame_id_counter += 1;
@@ -269,11 +276,13 @@ impl<'a> Estimator<'a> {
         // Bundle adjustment
         if current_frame.is_keyframe {
             let imu_start = Instant::now();
+            log::error!("[Estimator] IMU buffer size before preintegration: {}", self.imu_buffer.len());
             let imu_preint = self.piecewise_integration.propagate(
-                imu_data.unwrap_or(&[]),
+                &self.imu_buffer,
                 &self.accel_biases.last().unwrap_or(&Vector3::zeros()), // TODO: safeguard against empty history
                 &self.gyro_biases.last().unwrap_or(&Vector3::zeros()),
             );
+            self.imu_buffer.clear(); // Clear the buffer after preintegration
             
             current_frame.add_imu_preint(imu_preint);
             imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
@@ -283,6 +292,22 @@ impl<'a> Estimator<'a> {
             self.sliding_window.optimize(); // TODO handle error
             optimization_time_ms = optimization_start.elapsed().as_secs_f64() * 1000.0;
             self.view_optimization_results();
+
+            if !self.sliding_window.initialized && self.sliding_window.check_sliding_window_size_for_optimization().is_ok() {
+                self.sliding_window.solve_gyroscope_bias(&mut self.piecewise_integration);
+
+                let result = self.sliding_window.solve_linear_alignment();
+
+                let (g_refined, scale) = if result.is_ok() {
+                    self.sliding_window.initialized = true;
+                    // panic!("Linear alignment succeeded. Refined gravity: {:?}, scale: {:.6}", result.as_ref().unwrap().0, result.as_ref().unwrap().1);
+                    result.unwrap()
+                } else {
+                    log::warn!("[Estimator] Linear alignment failed: {:?}. Using default gravity and scale.", result.err());
+                    (na::Vector3::<f64>::new(0.0, 0.0, -9.81), 1.0)
+                };
+                self.piecewise_integration.gravity = g_refined;
+            }
         }
         
         // Final timing summary
@@ -393,7 +418,14 @@ impl<'a> Estimator<'a> {
             }
 
             // History of keyframe poses
-            let mat =  self.sliding_window.get_keyframe_poses().first().unwrap().clone();
+            // let mat =  self.sliding_window.get_keyframe_poses().first().unwrap().clone();
+            // TODO: currently safegaurding against jumps but needs to be put back once the optimization is stable
+            let kf_len = self.sliding_window.get_keyframe_poses().len();
+            let mat =  if kf_len > 1 {
+                self.sliding_window.get_keyframe_poses().get(1).unwrap().clone()
+            } else {
+                self.sliding_window.get_keyframe_poses().first().unwrap().clone()
+            };
             self.trajectory.push(mat);
 
             let vel = self.sliding_window.get_keyframe_velocities().first().unwrap().clone();

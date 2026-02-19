@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::AddAssign;
 use apex_solver::optimizer::SolverResult;
 use apex_solver::optimizer::levenberg_marquardt::{LevenbergMarquardt, LevenbergMarquardtConfig};
 use apex_solver::linalg::{LinearSolverType, SchurPreconditioner, SchurVariant};
@@ -33,7 +34,7 @@ pub struct SlidingWindow {
     pub map_points: HashMap<usize, [f32; 3]>,
 
     /// Initialized flag to indicate if the sliding window has been initialized with enough keyframes for optimization
-    initialized: bool,
+    pub initialized: bool,
 
 }
 
@@ -154,7 +155,7 @@ impl SlidingWindow {
             .with_jacobi_scaling(false)
     }
 
-    fn check_sliding_window_size_for_optimization(&self) -> Result<bool, std::io::Error> {
+    pub fn check_sliding_window_size_for_optimization(&self) -> Result<bool, std::io::Error> {
         if self.keyframes.is_empty() {
             log::warn!("[SlidingWindow] Cannot optimize: window is empty");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "Window is empty"));
@@ -296,7 +297,7 @@ impl SlidingWindow {
                     &kf_var,     // Current keyframe pose
                     &vb_var,     // Current keyframe velocity and biases
                 ];
-                let huber_loss = HuberLoss::new(2.0).unwrap();
+                let huber_loss = HuberLoss::new(3.0).unwrap();
                 problem.add_residual_block(&var_names, 
                     Box::new(imu_factor), Some(Box::new(huber_loss)));
             };
@@ -672,15 +673,15 @@ impl SlidingWindow {
         }
     }
 
-    pub fn solve_gyroscope_bias(&self, keyframes: &[Frame]) -> na::Vector3<f64> {
+    pub fn solve_gyroscope_bias(&mut self, imu_preintegrator: &mut ImuPiecewiseIntegration) -> Vec<na::Vector3<f64>> {
         let mut a = na::Matrix3::zeros();
-        let mut b = na::Matrix3::zeros();
+        let mut b = na::Vector3::zeros();
 
-        for (id, (frame_i, frame_j)) in keyframes.iter().zip(keyframes.iter().skip(1)).enumerate() {
+        for (id, (frame_i, frame_j)) in self.keyframes.iter().zip(self.keyframes.iter().skip(1)).enumerate() {
             let q_j = frame_j.state.T_W_B.fixed_view::<3, 3>(0, 0);
             let q_i = frame_i.state.T_W_B.fixed_view::<3, 3>(0, 0);
 
-            let q_ij = q_i.transpose() * q_j;
+            let q_ij = na::UnitQuaternion::from_matrix(&(q_i.transpose() * q_j));
 
             let tmp_a = if frame_j.imu_preintegration.is_some() && frame_i.imu_preintegration.is_some() {
                 frame_j.imu_preintegration.as_ref().unwrap().Jr_bg
@@ -688,7 +689,7 @@ impl SlidingWindow {
                 log::error!("[SlidingWindow] Cannot solve gyroscope bias: missing IMU preintegration for frames {} and {}", frame_i.frame_id, frame_j.frame_id);
                 na::Matrix3::identity() // TODO handle this case properly, maybe return Result or Option
             };
-            let tmp_b = (frame_j.imu_preintegration.as_ref().unwrap().dR.rotation_matrix() * q_ij);
+            let tmp_b = 2.0 * (frame_j.imu_preintegration.as_ref().unwrap().dR.quaternion().inverse() * q_ij).vector();
 
             a += tmp_a.transpose() * tmp_a;
             b += tmp_a.transpose() * tmp_b;
@@ -697,45 +698,49 @@ impl SlidingWindow {
 
         let mut bgs = Vec::new();
         let mut bga = Vec::new();
-        for (id, frame) in keyframes.iter().enumerate() {
+        for (id, frame) in self.keyframes.iter().enumerate() {
             log::debug!("Frame {} gyro bias before: {:?}", frame.frame_id, frame.state.gyro_bias);
-            let new_gyro_bias  = frame.state.gyro_bias + na::Vector3::new(delta_bg[(0, 0)], delta_bg[(1, 0)], delta_bg[(2, 0)]);
+            let new_gyro_bias  = frame.state.gyro_bias + delta_bg;
             bgs.push(new_gyro_bias);
 
             bga.push(frame.state.accel_bias);
         }
-        
-        let mut imu_preint = ImuPiecewiseIntegration::new();
 
-        for (id, frame) in keyframes.iter().enumerate() {
-            let new_gyro_bias = bgs[id];
-            let new_accel_bias = bga[id];
-            if let Some(preint) = frame.imu_preintegration.as_ref() {
-                let ba = na::Vector3::new(bga[id].x, bga[id].y, bga[id].z);
-                let bg = na::Vector3::new(bgs[id].x, bgs[id].y, bgs[id].z);
-                imu_preint.repropagate(
-                    &ba,
-                    &bg,
-                );
-            }
+        // Collect data before mutating self.keyframes
+        let updates: Vec<(usize, Option<_>)> = self.keyframes.iter().enumerate()
+            .filter_map(|(id, frame)| {
+                if let Some(preint) = frame.imu_preintegration.as_ref() {
+                    let updated_preint = imu_preintegrator.repropagate(&bga[id], &bgs[id]);
+                    Some((id, Some(updated_preint)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (id, updated_preint) in updates {
+            self.keyframes[id].imu_preintegration = updated_preint;
+            self.keyframes[id].state.gyro_bias = bgs[id];
+            self.keyframes[id].state.accel_bias = bga[id];
         }
-
-
-
-        na::Vector3::zeros() // Placeholder, implement actual bias estimation logic here
+        bgs
     }
 
-    pub fn solve_linear_alignment(&self, keyframes: &[Frame]) -> (Matrix4x4, f64) {
+    pub fn solve_linear_alignment(&self,) -> Result<(na::Vector3<f64>, f64), std::io::Error> {
         // This function would implement a linear method to solve for the initial alignment between the visual and inertial estimates
         // For example, it could use the method of Horn (1987) to find the best-fitting rotation and translation that aligns the visual odometry trajectory with the IMU preintegrated trajectory
         // The function would return the estimated transformation and a measure of the alignment error (e.g., RMSE)
 
-        let n_frames = keyframes.len();
+        let n_frames = self.keyframes.len();
         let n_states = n_frames * 3 + 3 + 1;
         let mut a = na::DMatrix::<f64>::zeros(n_states, n_states);
         let mut b = na::DVector::<f64>::zeros(n_states);
 
-        for (i, (frame_i, frame_j)) in keyframes.iter().zip(keyframes.iter().skip(1)).enumerate() {
+        // let T_B_W = self.keyframes[0].state.T_W_B.try_inverse().expect("T_W_B should be invertible");
+        // let t_B_W = T_B_W.fixed_view::<3, 1>(0, 3);
+        // let R_B_W = Matrix3x3::from(T_B_W.fixed_view::<3, 3>(0, 0));
+
+        for (i, (frame_i, frame_j)) in self.keyframes.iter().zip(self.keyframes.iter().skip(1)).enumerate() {
             let mut tmp_a = na::DMatrix::<f64>::zeros(6, 10);
             let mut tmp_b = na::DVector::<f64>::zeros(6);
 
@@ -745,20 +750,23 @@ impl SlidingWindow {
             let dv = &frame_j.imu_preintegration.as_ref().unwrap().dv;
 
             let I = na::Matrix3::<f64>::identity();
+            let ti = frame_i.state.T_W_B.fixed_view::<3, 1>(0, 3);
             let tj = frame_j.state.T_W_B.fixed_view::<3, 1>(0, 3);
-            let Rj = frame_j.state.T_W_B.fixed_view::<3, 3>(0, 0);
             let Ri = frame_i.state.T_W_B.fixed_view::<3, 3>(0, 0);
+            let Rj = frame_j.state.T_W_B.fixed_view::<3, 3>(0, 0);
             let RiT = Ri.transpose();
 
             tmp_a.view_mut((0, 0), (3, 3)).copy_from(&(-dt * I));
             tmp_a.view_mut((0, 6), (3, 3)).copy_from(&(RiT * dt * dt / 2.0 * I));
-            tmp_a.view_mut((0, 9), (3, 1)).copy_from(&(RiT * (Rj - Ri) / 100.0));
+            tmp_a.view_mut((0, 9), (3, 1)).copy_from(&(RiT * (tj - ti) / 100.0));
             
-            tmp_b.rows_mut(0, 3).copy_from(&(dp + RiT * Rj * tj - tj));
+            // tmp_b.rows_mut(0, 3).copy_from(&(dp + RiT * Rj * t_B_W - t_B_W));
+            tmp_b.rows_mut(0, 3).copy_from(&(dp)); // Assume data is in the body frame
 
             tmp_a.view_mut((3, 0), (3, 3)).copy_from(&(-I));
             tmp_a.view_mut((3, 3), (3, 3)).copy_from(&(RiT * Rj));
             tmp_a.view_mut((3, 6), (3, 3)).copy_from(&(RiT * dt * I));
+
             tmp_b.rows_mut(3, 3).copy_from(dv);
 
             let cov_inv = na::Matrix6::<f64>::identity();
@@ -766,30 +774,124 @@ impl SlidingWindow {
             let r_a = tmp_a.transpose() * cov_inv * &tmp_a;
             let r_b = tmp_a.transpose() * cov_inv * &tmp_b;
 
-            let mut a_block = a.view_mut((i * 3, i * 3), (6, 6));
-            a_block += r_a.view((0, 0), (6, 6));
+            a.view_mut((i * 3, i * 3), (6, 6)).add_assign(&r_a.view((0, 0), (6, 6)));
+            b.view_mut((i * 3, 0), (6, 1)).add_assign(&r_b.fixed_rows::<6>(0));
 
-            let mut b_segment = b.rows_mut(i * 3, 6);
-            b_segment += r_b.rows(0, 6);
+            a.view_mut((n_states - 4, n_states - 4), (4, 4)).add_assign(&r_a.view((r_a.nrows() - 4, r_a.ncols() - 4), (4, 4)));
+            b.rows_mut(n_states - 4, 4).add_assign(&r_b.fixed_rows::<4>(r_b.len() - 4));
 
-            let mut a_br = a.view_mut((n_states - 4, n_states - 4), (4, 4));
-            a_br += r_a.view((6, 6), (4, 4));
-
-            let mut b_tail = b.rows_mut(n_states - 4, 4);
-            b_tail += r_b.rows(6, 4);
-
-            let mut a_tr = a.view_mut((i * 3, n_states - 4), (6, 4));
-            a_tr += r_a.view((0, 6), (6, 4));
-
-            let mut a_bl = a.view_mut((n_states - 4, i * 3), (4, 6));
-            a_bl += r_a.view((6, 0), (4, 6));
+            a.view_mut((i * 3, n_states - 4), (6, 4)).add_assign(&r_a.view((0, r_a.ncols() - 4), (6, 4)));
+            a.view_mut((n_states - 4, i * 3), (4, 6)).add_assign(&r_a.view((r_a.nrows() - 4, 0), (4, 6)));
         }
+
         a *= 1000.0;
         b *= 1000.0;
-        let solution = a.cholesky().expect("Matrix A should be positive definite").solve(&b);
-        let s = solution.rows(n_states - 1, 1) / 1000.0;
+        let mut solution = a.cholesky().expect("Matrix A should be positive definite").solve(&b);
+        let s = solution[n_states - 1] / 100.0;
+        log::info!("[Linear Alignment] Linear alignment scale factor: {:.6}", s);
 
-        (Matrix4x4::identity(), 0.0) // Placeholder, implement actual alignment logic here
+        let g = solution.fixed_rows::<3>(n_states - 4).into_owned();
+        log::debug!("[Linear Alignment] Result g: {:?}, {:?}", g.norm(), g.transpose());
+        let g_prior = na::Vector3::<f64>::new(0.0, 0.0, -9.81);
+        if (g.norm() - g_prior.norm()).abs() > 0.1 || s < 0.0 {
+            log::warn!("[Linear Alignment] Linear alignment result is invalid. g.norm(): {:.6}, g_prior.norm(): {:.6}, scale factor: {:.6}", g.norm(), g_prior.norm(), s);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Linear alignment result is invalid. Need more motion"));
+        }
+
+        let g_refined = self.refine_gravity(&g, g_prior);
+
+        let s = solution[n_states - 1] / 100.0;
+        let last_idx = solution.len() - 1;
+        solution[last_idx] = s;
+        log::debug!("[Linear Alignment] Result g: {:?}, {:?}", g_refined.norm(), g_refined.transpose());
+
+        if s < 0.0 {
+            log::warn!("[Linear Alignment] Negative scale factor from linear alignment, setting to 1.0");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Negative scale factor from linear alignment"));
+        } else {
+            Ok((g_refined, s))
+        }
+    }
+
+    fn refine_gravity(&self, initial_g: &na::Vector3<f64>, g_prior: na::Vector3<f64>) -> na::Vector3<f64> {
+        // This function would implement a non-linear optimization to refine the gravity vector estimate based on the keyframe poses and IMU preintegrations
+        // It could use a similar approach to the gyroscope bias estimation, but with a more complex cost function that measures how well the gravity vector explains the observed accelerations in the IMU preintegrations given the keyframe poses
+        // The function would return the refined gravity vector
+        let n_frames = self.keyframes.len();
+        let n_states = n_frames * 3 + 2 + 1;
+        let mut a = na::DMatrix::<f64>::zeros(n_states, n_states);
+        let mut b = na::DVector::<f64>::zeros(n_states);
+
+        let mut g = initial_g.clone();
+
+        for j in 0..4 {
+            let lxly = self.tangent_basis(&g);
+
+            for (i, (frame_i, frame_j)) in self.keyframes.iter().zip(self.keyframes.iter().skip(1)).enumerate() {
+                let mut tmp_a = na::DMatrix::<f64>::zeros(6, 9);
+                let mut tmp_b = na::DVector::<f64>::zeros(6);
+
+                let dt = frame_j.imu_preintegration.as_ref().unwrap().dt;
+                let dp = &frame_j.imu_preintegration.as_ref().unwrap().dp;
+                let dv = &frame_j.imu_preintegration.as_ref().unwrap().dv;
+
+                let I = na::Matrix3::<f64>::identity();
+                let ti = frame_i.state.T_W_B.fixed_view::<3, 1>(0, 3);
+                let tj = frame_j.state.T_W_B.fixed_view::<3, 1>(0, 3);
+                let Ri = frame_i.state.T_W_B.fixed_view::<3, 3>(0, 0);
+                let Rj = frame_j.state.T_W_B.fixed_view::<3, 3>(0, 0);
+                let RiT = Ri.transpose();
+
+                tmp_a.view_mut((0, 0), (3, 3)).copy_from(&(-dt * I));
+                tmp_a.view_mut((0, 6), (3, 2)).copy_from(&(RiT * dt * dt / 2.0 * I * lxly));
+                tmp_a.view_mut((0, 8), (3, 1)).copy_from(&(RiT * (tj - ti) / 100.0));
+                
+                tmp_b.rows_mut(0, 3).copy_from(&(dp - RiT * dt * dt / 2.0 * g));
+
+                tmp_a.view_mut((3, 0), (3, 3)).copy_from(&(-I));
+                tmp_a.view_mut((3, 3), (3, 3)).copy_from(&(RiT * Rj));
+                tmp_a.view_mut((3, 6), (3, 2)).copy_from(&(RiT * dt * I * lxly));
+
+                tmp_b.rows_mut(3, 3).copy_from(&(dv - RiT * dt * I * g));
+
+                let cov_inv = na::Matrix6::<f64>::identity();
+
+                let r_a = tmp_a.transpose() * cov_inv * &tmp_a;
+                let r_b = tmp_a.transpose() * cov_inv * &tmp_b;
+
+                a.view_mut((i * 3, i * 3), (6, 6)).add_assign(&r_a.view((0, 0), (6, 6)));
+                b.view_mut((i * 3, 0), (6, 1)).add_assign(&r_b.fixed_rows::<6>(0));
+
+                a.view_mut((n_states - 3, n_states - 3), (3, 3)).add_assign(&r_a.view((r_a.nrows() - 3, r_a.ncols() - 3), (3, 3)));
+                b.rows_mut(n_states - 3, 3).axpy(1.0, &r_b.rows(r_b.len() - 3, 3), 1.0);
+
+                a.view_mut((i * 3, n_states - 3), (6, 3)).add_assign(&r_a.view((0, r_a.ncols() - 3), (6, 3)));
+                a.view_mut((n_states - 3, i * 3), (3, 6)).add_assign(&r_a.view((r_a.nrows() - 3, 0), (3, 6)));
+
+            };
+            a *= 1000.0;
+            b *= 1000.0;
+            let solution = a.clone().cholesky().expect("Matrix A should be positive definite").solve(&b);
+            let dg = solution.fixed_rows::<2>(n_states - 3);
+            g = (g + lxly * dg).normalize() * g_prior.norm();
+        };
+        
+
+        g // Placeholder, implement actual gravity refinement logic here
+    }
+
+    fn tangent_basis(&self, g0: &na::Vector3<f64>) -> na::Matrix3x2<f64> {
+        let a = na::Unit::new_normalize(*g0);  // Equivalent to g0.normalized()
+        let mut tmp = na::Vector3::new(0.0, 0.0, 1.0);
+        if a.as_ref() == &tmp {
+            tmp = na::Vector3::new(1.0, 0.0, 0.0);
+        }
+        let b = na::Unit::new_normalize(tmp - a.as_ref() * (a.as_ref().dot(&tmp)));
+        let c = a.cross(&b);
+        let mut bc = na::Matrix3x2::<f64>::zeros();
+        bc.column_mut(0).copy_from(b.as_ref());
+        bc.column_mut(1).copy_from(&c);
+        bc
     }
 }
 

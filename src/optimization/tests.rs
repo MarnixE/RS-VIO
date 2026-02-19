@@ -461,7 +461,8 @@ mod tests {
             T_C_B: na::Matrix4<f64>,  // T_C_B: SE3 transform from B to C
             fixed_pose: Option<na::Matrix4<f64>>,
         ) {
-            let mut factor = BundleAdjustmentFactor::new(observation, T_C_B);
+            // let sqrt_info = na::Matrix2::identity(); // Assuming unit covariance for simplicity
+            let mut factor = BundleAdjustmentFactor::new(observation, T_C_B, None);
             if let Some(pose) = fixed_pose {
                 factor = factor.with_fixed_pose(pose);
             }
@@ -866,9 +867,10 @@ mod tests {
             Jp_ba: Matrix3::zeros(),
             inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
             inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
-            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            // cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
             // gyro_random_walk: Vector3::from_element(0.00),
             // accel_random_walk: Vector3::from_element(0.00), // no whitening
+            imu_buffer: Vec::new(), // not used
         };
 
         let factor = ImuFactor::new(preint, bai, bgi);
@@ -910,6 +912,7 @@ mod tests {
             cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
             // gyro_random_walk: Vector3::from_element(0.00),
             // accel_random_walk: Vector3::from_element(0.00), // no whitening
+            imu_buffer: Vec::new(), // not used
         };
 
         let bias_a = Vector3::zeros();

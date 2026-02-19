@@ -33,6 +33,8 @@ pub struct PreInt {
 
     /// Buffers for repropagation
     imu_buffer: Vec<ImuData>,
+
+    pub gravity: na::Vector3<f64>,
 }
 
 impl fmt::Debug for PreInt {
@@ -93,6 +95,7 @@ pub struct ImuPiecewiseIntegration {
     gyro_random_walk: na::Matrix3<f64>,
     imu_buffer: Vec<ImuData>,
     // preintegrated_noise: na::SVector<f64, 9>,
+    pub gravity: na::Vector3<f64>,
 }
 
 #[allow(non_snake_case)]
@@ -108,6 +111,7 @@ impl ImuPiecewiseIntegration {
             accel_random_walk: na::Matrix3::zeros(),
             gyro_random_walk: na::Matrix3::zeros(),
             imu_buffer: Vec::new(),
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
             // preintegrated_noise: na::SVector::<f64, 9>::zeros(),
         }
     }
@@ -121,6 +125,7 @@ impl ImuPiecewiseIntegration {
             accel_random_walk: na::Matrix3::identity() * config.accel_random_walk.powi(2),
             gyro_random_walk: na::Matrix3::identity() * config.gyro_random_walk.powi(2),
             imu_buffer: Vec::new(),
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
             // preintegrated_noise: na::SVector::<f64, 9>::from_element(1.0),
         }
     }
@@ -148,6 +153,7 @@ impl ImuPiecewiseIntegration {
         // let bias_a = biases.rows(3, 3);
         // let bias_g = self.gyro_random_walk; // Placeholder for gyro bias
         // let bias_a = self.accel_random_walk; // Placeholder for accel bias
+        log::warn!("Gravity in preintegration: {:?}", self.gravity);
 
         for (i, imu) in imu_slice.iter().enumerate() {
             ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
@@ -211,6 +217,7 @@ impl ImuPiecewiseIntegration {
                 inv_chol: Matrix9::identity(), // Identity since covariance is near zero
                 inv_chol_bias: na::Matrix6::identity(), // Identity for bias as well
                 imu_buffer: imu_slice.to_vec(), // Store the raw IMU data for potential repropagation
+                gravity: self.gravity, // Default gravity
             };
         }
 
@@ -237,6 +244,7 @@ impl ImuPiecewiseIntegration {
             inv_chol: self.compute_inv_chol(&cov_ik), // Compute square root information matrix
             inv_chol_bias: self.inv_chol_bias(&sigma), // Identity for bias as well
             imu_buffer: imu_slice.to_vec(), // Store the raw IMU data for potential repropagation
+            gravity: self.gravity, // Default gravity
         }
     }
 

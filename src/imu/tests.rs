@@ -30,7 +30,7 @@ mod tests {
         let bias_g = na::Vector3::zeros();
         let mut bias_a = na::Vector3::zeros();
         bias_a[2] = 9.81;
-        let result = integrator.integrate(&imu_data, &bias_a, &bias_g);
+        let result = integrator.propagate(&imu_data, &bias_a, &bias_g);
 
         // Rotation should remain identity
         let q = result.dR;
@@ -131,7 +131,7 @@ mod tests {
 
         let mut integrator = ImuPiecewiseIntegration::new(/* noise params etc */);
 
-        let out = integrator.integrate(&imu_slice, &bias_a, &bias_g);
+        let out = integrator.propagate(&imu_slice, &bias_a, &bias_g);
         let (dR_ref, dv_ref, dp_ref) = reference_preint(&imu_slice, &bias_a, &bias_g);
 
         // Rotation: compare on tangent spacee
@@ -156,13 +156,13 @@ mod tests {
 
         let mut integrator = ImuPiecewiseIntegration::new();
 
-        let base = integrator.integrate(&imu_slice, &bias_a, &bias_g);
+        let base = integrator.propagate(&imu_slice, &bias_a, &bias_g);
 
         for axis in 0..3 {
             let mut bias_a2 = bias_a;
             bias_a2[axis] += eps;
 
-            let out2 = integrator.integrate(&imu_slice, &bias_a2, &bias_g);
+            let out2 = integrator.propagate(&imu_slice, &bias_a2, &bias_g);
 
             let fd_dv = (out2.dv - base.dv) / eps;
             let col = base.Jv_ba.column(axis);
@@ -179,7 +179,7 @@ mod tests {
             let mut bias_g2 = bias_g;
             bias_g2[axis] += eps;
 
-            let out2 = integrator.integrate(&imu_slice, &bias_a, &bias_g2);
+            let out2 = integrator.propagate(&imu_slice, &bias_a, &bias_g2);
 
             let fd_dv = (out2.dv - base.dv) / eps;
             let col = base.Jv_bg.column(axis);
