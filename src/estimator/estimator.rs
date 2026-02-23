@@ -276,7 +276,7 @@ impl<'a> Estimator<'a> {
         // Bundle adjustment
         if current_frame.is_keyframe {
             let imu_start = Instant::now();
-            log::error!("[Estimator] IMU buffer size before preintegration: {}", self.imu_buffer.len());
+            log::error!("IMU buffer size before preintegration: {}", self.imu_buffer.len());
             let imu_preint = self.piecewise_integration.propagate(
                 &self.imu_buffer,
                 &self.accel_biases.last().unwrap_or(&Vector3::zeros()), // TODO: safeguard against empty history

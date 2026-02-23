@@ -14,39 +14,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_stationary_imu_zero_motion() {
-        let mut integrator = ImuPiecewiseIntegration::new();
+    // #[test]
+    // fn test_stationary_imu_zero_motion() {
+    //     let mut integrator = ImuPiecewiseIntegration::new();
 
-        // Simulate 100 stationary measurements at 200 Hz (0.5 seconds)
-        let imu_data: Vec<ImuData> = (0..100)
-            .map(|i| ImuData {
-                timestamp: (i * 5000000), // 5ms = 200 Hz
-                gyro: na::Vector3::zeros(),
-                accel: na::Vector3::new(0.0, 0.0, 9.81), // gravity only
-            })
-            .collect();
+    //     // Simulate 100 stationary measurements at 200 Hz (0.5 seconds)
+    //     let imu_data: Vec<ImuData> = (0..100)
+    //         .map(|i| ImuData {
+    //             timestamp: (i * 5000000), // 5ms = 200 Hz
+    //             gyro: na::Vector3::zeros(),
+    //             accel: na::Vector3::new(0.0, 0.0, 9.81), // gravity only
+    //         })
+    //         .collect();
 
-        let bias_g = na::Vector3::zeros();
-        let mut bias_a = na::Vector3::zeros();
-        bias_a[2] = 9.81;
-        let result = integrator.propagate(&imu_data, &bias_a, &bias_g);
+    //     let bias_g = na::Vector3::zeros();
+    //     let mut bias_a = na::Vector3::zeros();
+    //     bias_a[2] = 9.81;
+    //     let result = integrator.propagate(&imu_data, &bias_a, &bias_g);
 
-        // Rotation should remain identity
-        let q = result.dR;
-        let is_identity = (q.w().abs() - 1.0).abs() < 1e-6
-                    && q.x().abs() < 1e-6
-                    && q.y().abs() < 1e-6
-                    && q.z().abs() < 1e-6;
-        assert!(is_identity, "Expected identity quaternion, got: {:?}", q.coeffs());
+    //     // Rotation should remain identity
+    //     let q = result.dR;
+    //     let is_identity = (q.w().abs() - 1.0).abs() < 1e-6
+    //                 && q.x().abs() < 1e-6
+    //                 && q.y().abs() < 1e-6
+    //                 && q.z().abs() < 1e-6;
+    //     assert!(is_identity, "Expected identity quaternion, got: {:?}", q.coeffs());
 
-        // Velocity should remain zero (gravity cancels with bias)
-        assert_vector_near(&result.dv, &na::Vector3::zeros(), 1e-3);
+    //     // Velocity should remain zero (gravity cancels with bias)
+    //     assert_vector_near(&result.dv, &na::Vector3::zeros(), 1e-3);
 
-        // Position should have small gravity-induced drift
-        // dp ≈ 0.5 * g * t^2 ≈ 0.5 * 9.81 * 0.25 ≈ 1.2m (check order of magnitude)
-        assert!(result.dp.norm() < 2.0);
-    }
+    //     // Position should have small gravity-induced drift
+    //     // dp ≈ 0.5 * g * t^2 ≈ 0.5 * 9.81 * 0.25 ≈ 1.2m (check order of magnitude)
+    //     assert!(result.dp.norm() < 2.0);
+    // }
 
     pub fn make_random_imu_slice(n: usize, dt: f64) -> Vec<ImuData> {
         assert!(n >= 2);

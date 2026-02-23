@@ -6,8 +6,9 @@ use nalgebra::{self as na, Cholesky, SymmetricEigen};
 use apex_solver::manifold::{LieGroup, so3::SO3};
 
 // type Matrix6 = na::SMatrix<f64, 6, 6>;
-type Matrix9 = na::SMatrix<f64, 9, 9>;
-type Vector9 = na::SVector<f64, 9>;
+type Matrix15 = na::SMatrix<f64, 15, 15>;
+type Matrix12 = na::SMatrix<f64, 12, 12>;
+type Vector12 = na::SVector<f64, 12>;
 
 #[derive(Clone)]
 #[allow(non_snake_case, dead_code)]
@@ -15,7 +16,7 @@ pub struct PreInt {
     pub dR: SO3,
     pub dv: na::Vector3<f64>,
     pub dp: na::Vector3<f64>,
-    pub cov: Matrix9,
+    pub cov: Matrix15,
     pub dt: f64,
     // pub bias_g: na::Vector3<f64>,
     // pub bias_a: na::Vector3<f64>,
@@ -28,11 +29,11 @@ pub struct PreInt {
     // pub gyro_random_walk: na::Matrix3<f64>,
     // pub accel_random_walk: na::Matrix3<f64>,
 
-    pub inv_chol: Matrix9,
+    pub inv_chol: Matrix15,
     pub inv_chol_bias: na::Matrix6<f64>,
 
     /// Buffers for repropagation
-    imu_buffer: Vec<ImuData>,
+    pub imu_buffer: Vec<ImuData>,
 
     pub gravity: na::Vector3<f64>,
 }
@@ -63,7 +64,7 @@ impl PreInt {
 
         let L = chol.l();
 
-        // W = L^{-1}  (triangular inverse is fine for 9x9)
+        // W = L^{-1}  (triangular inverse is fine for 15x15)
         let W = L
             .try_inverse()
             .expect("Failed to invert Cholesky factor");
@@ -71,17 +72,17 @@ impl PreInt {
         self.inv_chol = W.clone();
     }
 
-    pub fn whiten_residual_9(&self, r: &Vector9) -> Vector9 {
+    pub fn whiten_residual_15(&self, r: &na::SVector<f64, 15>) -> na::SVector<f64, 15> {
         self.inv_chol * r
     }
 
     pub fn whiten_jacobian_15<const N: usize>(&self, J: &na::SMatrix<f64, 15, N>) -> na::SMatrix<f64, 15, N> {
-        // self.inv_chol * J
-        let mat = na::stack![
-            self.inv_chol, 0;
-            0, self.inv_chol_bias
-        ];
-        mat * J
+        self.inv_chol * J
+        // let mat = na::stack![];
+        //     self.inv_chol, 0;
+        //     0, self.inv_chol_bias
+        // ];
+        // mat * J
     }
 }
 
@@ -147,13 +148,17 @@ impl ImuPiecewiseIntegration {
         let mut Jp_bg = na::Matrix3::zeros();
         let mut Jp_ba = na::Matrix3::zeros();
 
-        let mut cov_ik = na::SMatrix::<f64, 9, 9>::zeros(); 
+        let mut cov_ik = na::SMatrix::<f64, 15, 15>::zeros(); 
+
+        
 
         // let bias_g = biases.rows(0, 3);
         // let bias_a = biases.rows(3, 3);
         // let bias_g = self.gyro_random_walk; // Placeholder for gyro bias
         // let bias_a = self.accel_random_walk; // Placeholder for accel bias
         log::warn!("Gravity in preintegration: {:?}", self.gravity);
+
+        // let mut delta_q = na::Quaternion::identity();
 
         for (i, imu) in imu_slice.iter().enumerate() {
             ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
@@ -164,8 +169,12 @@ impl ImuPiecewiseIntegration {
             }
             prev_ts = ts;
 
-            let acc_unbiased = imu.accel - bias_a;
             let omega_unbiased = imu.gyro - bias_g;
+            let acc_unbiased = (imu.accel - bias_a);
+            // delta_q = na::Quaternion::new(1.0, 
+            //     omega_unbiased[0] * dt / 2.0, 
+            //     omega_unbiased[1] * dt / 2.0, 
+            //     omega_unbiased[2] * dt / 2.0);
 
             let dphi = omega_unbiased  * dt; // Angular increment
             let dR_kkp1 = SO3::from_scaled_axis(dphi);
@@ -205,7 +214,7 @@ impl ImuPiecewiseIntegration {
                 dR: SO3::identity(),
                 dv: na::Vector3::zeros(),
                 dp: na::Vector3::zeros(),
-                cov: Matrix9::identity() * 1e-6, // Small covariance to avoid singularity
+                cov: Matrix15::identity() * 1e-6, // Small covariance to avoid singularity
                 dt: dt_step,
                 Jr_bg: na::Matrix3::zeros(),
                 Jv_bg: na::Matrix3::zeros(),
@@ -214,7 +223,7 @@ impl ImuPiecewiseIntegration {
                 Jp_ba: na::Matrix3::zeros(),
                 // gyro_random_walk: self.gyro_random_walk,
                 // accel_random_walk: self.accel_random_walk,
-                inv_chol: Matrix9::identity(), // Identity since covariance is near zero
+                inv_chol: Matrix15::identity(), // Identity since covariance is near zero
                 inv_chol_bias: na::Matrix6::identity(), // Identity for bias as well
                 imu_buffer: imu_slice.to_vec(), // Store the raw IMU data for potential repropagation
                 gravity: self.gravity, // Default gravity
@@ -275,7 +284,7 @@ impl ImuPiecewiseIntegration {
         }
     }
 
-    fn construct_A(&self, dR_kkp1: &SO3, dR_ik: &SO3, acc_unbiased: &na::Vector3<f64>, dt: f64) -> na::SMatrix<f64, 9, 9> {
+    fn construct_A(&self, dR_kkp1: &SO3, dR_ik: &SO3, acc_unbiased: &na::Vector3<f64>, dt: f64) -> na::SMatrix<f64, 15, 15> {
         let I3 = na::Matrix3::<f64>::identity();
 
         let R_ik = dR_ik.rotation_matrix();               // ΔR_{i,k}
@@ -287,46 +296,72 @@ impl ImuPiecewiseIntegration {
         let A_vphi = -R_ik * a_hat * dt;
         let A_pphi = -0.5 * R_ik * a_hat * (dt * dt);
         let A_pv = I3 * dt;
+
+        let A_phibg = -I3 * dt;
+        let A_vba   = -R_ik * dt;
+        let A_pba   = -0.5 * R_ik * dt * dt;
         
         // let A: na::SMatrix<f64, 9, 9> = 
         na::stack![
-            A_phiphi, 0, 0;
-            A_vphi, I3, 0;
-            A_pphi, A_pv, I3
+            A_phiphi, 0, 0, 0, A_phibg;
+            A_vphi, I3, 0, A_vba, 0;
+            A_pphi, A_pv, I3, A_pba, 0;
+            0, 0, 0, I3, 0;
+            0, 0, 0, 0, I3
         ]
         // A
     }
 
-    fn construct_B(&self, Jr: &na::Matrix3<f64>, dR_ik: &SO3, dt: f64) -> na::SMatrix<f64, 9, 6> {
+    fn construct_B(&self, Jr: &na::Matrix3<f64>, dR_ik: &SO3, dt: f64) -> na::SMatrix<f64, 15, 12> {
+        let I3 = na::Matrix3::<f64>::identity();
         let R_ik = dR_ik.rotation_matrix();
 
         let B_phig = Jr * dt;
         let B_va   = R_ik * dt;
         let B_pa   = 0.5 * R_ik * (dt * dt);
 
+        let B_ba = I3 * dt;                   // b_a <- accel-bias RW noise
+        let B_bg = I3 * dt;                   // b_g <- gyro-bias  RW noise
+
         na::stack![
-            B_phig, 0;
-            0, B_va;
-            0, B_pa
+            B_phig, 0, 0, 0;
+            0, B_va, 0, 0;
+            0, B_pa, 0, 0;
+            0, 0, B_ba, 0;
+            0, 0, 0, B_bg
         ]
     }
 
-    fn cov_eta(&self, dt: f64) -> na::SMatrix<f64, 6, 6> {
+    fn cov_eta(&self, dt: f64) -> na::SMatrix<f64, 12, 12> {
         let I3 = na::Matrix3::<f64>::identity();
-        let sigma_g = self.gyro_noise_density;
-        let sigma_a = self.accel_noise_density;
-        let Qg = (sigma_g * sigma_g / dt) * I3; // Σ_gd
-        let Qa = (sigma_a * sigma_a / dt) * I3; // Σ_ad
-        na::stack![Qg, 0; 
-            0, Qa]
+
+        let gyr_n = self.gyro_noise_density;   // GYR_N in VINS config meaning
+        let acc_n = self.accel_noise_density;  // ACC_N
+        let acc_w = self.accel_random_walk;        // ACC_W
+        let gyr_w = self.gyro_random_walk;         // GYR_W
+
+        // Effective per-step noise for midpoint-averaged samples
+        let Qg = 0.5 * (gyr_n * gyr_n) * I3;   // n_omega
+        let Qa = 0.5 * (acc_n * acc_n) * I3;  // n_a
+
+        // Bias random walk noises (not averaged)
+        let Qba = (acc_w * acc_w) * I3;        // n_ba
+        let Qbg = (gyr_w * gyr_w) * I3;        // n_bg
+
+        na::stack![
+            Qg, 0, 0, 0;
+            0, Qa, 0, 0;
+            0, 0, Qba, 0;
+            0, 0, 0, Qbg
+        ]
     }
 
-    pub fn compute_inv_chol(&self, sigma: &Matrix9) -> Matrix9 {
+    pub fn compute_inv_chol(&self, sigma: &Matrix15) -> Matrix15 {
         // 1) Symmetrize (numerical hygiene)
         let sigma = 0.5 * (sigma + sigma.transpose());
 
         // 2) Cholesky: Σ = L L^T
-        let sigma_reg = sigma + Matrix9::identity() * 1e-6;
+        let sigma_reg = sigma + Matrix15::identity() * 1e-6;
         let chol = na::Cholesky::new(sigma_reg);
         let L = chol.as_ref().unwrap().l();
 

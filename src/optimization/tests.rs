@@ -858,6 +858,7 @@ mod tests {
         let preint = PreInt {
             dt,
             dR,
+            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
             dv: Vector3::zeros(),
             dp: Vector3::zeros(),
             Jr_bg: Matrix3::zeros(),
@@ -867,10 +868,8 @@ mod tests {
             Jp_ba: Matrix3::zeros(),
             inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
             inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
-            // cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
-            // gyro_random_walk: Vector3::from_element(0.00),
-            // accel_random_walk: Vector3::from_element(0.00), // no whitening
             imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
         };
 
         let factor = ImuFactor::new(preint, bai, bgi);
@@ -913,6 +912,7 @@ mod tests {
             // gyro_random_walk: Vector3::from_element(0.00),
             // accel_random_walk: Vector3::from_element(0.00), // no whitening
             imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
         };
 
         let bias_a = Vector3::zeros();
@@ -980,6 +980,8 @@ mod tests {
             cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
             // gyro_random_walk: Vector3::from_element(0.00),
             // accel_random_walk: Vector3::from_element(0.00), // no whitening
+            imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
         };
 
         let bias_a = Vector3::new(0.01, -0.02, 0.03);
@@ -1058,8 +1060,8 @@ mod tests {
             inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
             inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
             cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
-            // gyro_random_walk: Vector3::from_element(0.00),
-            // accel_random_walk: Vector3::from_element(0.00), // no whitening
+            imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
         };
         let factor = ImuFactor::new(preint, Vector3::zeros(), Vector3::zeros());
 
@@ -1366,7 +1368,10 @@ mod tests {
             // gyro_random_walk: na::Vector3::<f64>::from_element(1.0), 
             // accel_random_walk: na::Vector3::<f64>::from_element(1.0), 
             inv_chol: na::SMatrix::<f64, 9, 9>::identity(),
-            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity() }
+            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            imu_buffer: Vec::new(), // not used
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
+        }
     }
 
 }
