@@ -858,18 +858,19 @@ mod tests {
         let preint = PreInt {
             dt,
             dR,
-            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
             dv: Vector3::zeros(),
             dp: Vector3::zeros(),
             Jr_bg: Matrix3::zeros(),
             Jv_bg: Matrix3::zeros(),
             Jv_ba: Matrix3::zeros(),
-            Jp_bg: Matrix3::zeros(),
-            Jp_ba: Matrix3::zeros(),
-            inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
-            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            linearized_ba: Vector3::zeros(),
+            linearized_bg: Vector3::zeros(),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
+            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
             imu_buffer: Vec::new(), // not used
-            gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            gravity: g,
         };
 
         let factor = ImuFactor::new(preint, bai, bgi);
@@ -887,6 +888,7 @@ mod tests {
 
         // Residual should be ~0 (numerical eps).
         for k in 0..15 {
+            print!("r[{}] = {:.6e}  ", k, r[k]);
             assert_abs_diff_eq!(r[k], 0.0, epsilon = 1e-10);
         }
     }
@@ -904,15 +906,16 @@ mod tests {
             Jr_bg: Matrix3::zeros(),
             Jv_bg: Matrix3::zeros(),
             Jv_ba: Matrix3::zeros(),
-            Jp_bg: Matrix3::zeros(),
-            Jp_ba: Matrix3::zeros(),
-            inv_chol: na::SMatrix::<f64, 9, 9>::identity() * 2.0, // no whitening
-            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity() * 3.0,
-            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            linearized_ba: Vector3::zeros(),
+            linearized_bg: Vector3::zeros(),
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity() * 2.0, // no whitening
+            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity() * 3.0,
+            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
             // gyro_random_walk: Vector3::from_element(0.00),
             // accel_random_walk: Vector3::from_element(0.00), // no whitening
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
         };
 
         let bias_a = Vector3::zeros();
@@ -934,18 +937,20 @@ mod tests {
 
         // Now compute the same residual with whitening disabled (w9=1,w6=1) and compare scaling.
         let mut preint_un = preint.clone();
-        preint_un.inv_chol = na::SMatrix::<f64, 9, 9>::identity();
-        preint_un.inv_chol_bias = na::SMatrix::<f64, 6, 6>::identity();
+        preint_un.sqrt_info = na::SMatrix::<f64, 15, 15>::identity();
+        preint_un.sqrt_info_bias = na::SMatrix::<f64, 6, 6>::identity();
         let factor_un = ImuFactor::new(preint_un, bias_a, bias_g);
         let (r_un, j_un) = factor_un.linearize(&params, true);
         let j_un = j_un.unwrap();
+
+        print!("Finite-difference column {:?}\n{:?}", r_wh, r_un);
 
         // First 9 rows scaled by 2, last 6 rows scaled by 3.
         for k in 0..9 {
             assert_relative_eq!(r_wh[k], 2.0 * r_un[k], epsilon = 1e-10);
         }
         for k in 9..15 {
-            assert_relative_eq!(r_wh[k], 3.0 * r_un[k], epsilon = 1e-10);
+            assert_relative_eq!(r_wh[k], 2.0 * r_un[k], epsilon = 1e-10);
         }
 
         // Same for Jacobian rows.
@@ -956,7 +961,7 @@ mod tests {
         }
         for row in 9..15 {
             for col in 0..30 {
-                assert_relative_eq!(j_wh[(row, col)], 3.0 * j_un[(row, col)], epsilon = 1e-10);
+                assert_relative_eq!(j_wh[(row, col)], 2.0 * j_un[(row, col)], epsilon = 1e-10);
             }
         }
     }
@@ -973,19 +978,20 @@ mod tests {
             Jr_bg: 0.01 * Matrix3::identity(),
             Jv_bg: 0.02 * Matrix3::identity(),
             Jv_ba: 0.03 * Matrix3::identity(),
-            Jp_bg: 0.04 * Matrix3::identity(),
-            Jp_ba: 0.05 * Matrix3::identity(),
-            inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
-            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
-            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            linearized_bg: 0.04 * Vector3::zeros(),
+            linearized_ba: 0.05 * Vector3::zeros(),
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
+            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
             // gyro_random_walk: Vector3::from_element(0.00),
             // accel_random_walk: Vector3::from_element(0.00), // no whitening
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
         };
 
-        let bias_a = Vector3::new(0.01, -0.02, 0.03);
-        let bias_g = Vector3::new(-0.001, 0.002, -0.003);
+        let bias_a = Vector3::new(0.021, -0.011, -0.031);
+        let bias_g = Vector3::new(-0.0041, 0.0031, 0.0021);
         let factor = ImuFactor::new(preint, bias_a, bias_g);
 
         let qi = UnitQuaternion::from_scaled_axis(Vector3::new(0.02, -0.01, 0.03));
@@ -1025,6 +1031,7 @@ mod tests {
             let (rm, _) = factor.linearize(&pm, false);
 
             let num = (rp - rm) * (0.5 / eps);
+            print!("Finite-difference column {}: {:?}\n", col, num.transpose());
 
             // Compare column to finite-difference (allow slightly looser tolerance for rotation components).
             for row in 0..15 {
@@ -1038,7 +1045,8 @@ mod tests {
                     j[(row, col)],
                     num[row],
                     diff,
-                    tol
+                    tol,
+                    // params
                 );
             }
         }
@@ -1054,12 +1062,12 @@ mod tests {
             Jr_bg: Matrix3::zeros(),
             Jv_bg: Matrix3::zeros(),
             Jv_ba: Matrix3::zeros(),
-            Jp_bg: Matrix3::zeros(),
-            Jp_ba: Matrix3::zeros(),
-
-            inv_chol: na::SMatrix::<f64, 9, 9>::identity(), // no whitening
-            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
-            cov: na::SMatrix::<f64, 9, 9>::identity(), // not used
+            linearized_ba: Vector3::zeros(),
+            linearized_bg: Vector3::zeros(),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
+            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
         };
@@ -1221,7 +1229,7 @@ mod tests {
         let dt = 0.05;
 
         // Gravity must match your factor's convention.
-        let g_w = Vector3::new(0.0, 0.0, 9.81);
+        let g_w = Vector3::new(0.0, 0.0, -9.81);
 
         // Random-ish pose i
         let t_i = Vector3::new(
@@ -1296,10 +1304,9 @@ mod tests {
 
         // You must adapt these conversions to your so3/se3 types.
         let delta_r_mat = r_i_t * r_j;
-        let delta_v = r_i_t * (v_j - v_i - g_w * dt);
-        let delta_p = r_i_t * (t_j - t_i - v_i * dt - 0.5 * g_w * dt * dt);
+        let delta_v = r_i_t * (v_j - v_i + g_w * dt);
+        let delta_p = r_i_t * (t_j - t_i - v_i * dt + 0.5 * g_w * dt * dt);
 
-        // TODO: replace with your real preint constructor / builder.
         // The key is: set dt, dR, dv, dp, bias linearization point (bias_a, bias_g),
         // and make whitening identity (or consistent) so FD compares apples-to-apples.
         let preint = make_preint_identity(dt, delta_r_mat, delta_v, delta_p);
@@ -1307,8 +1314,8 @@ mod tests {
         // Factor biases must equal ba_i/bg_i used to define db_a/db_g=0 at GT
         let factor = ImuFactor {
             preint,
-            bias_a: ba_i,
-            bias_g: bg_i,
+            linearized_bias_a: ba_i,
+            linearized_bias_g: bg_i,
             // ... fill any other fields you have ...
         };
 
@@ -1323,8 +1330,9 @@ mod tests {
         let r_norm = r_gt.norm();
         assert!(
             r_norm < 1e-8,
-            "Residual at ground truth should be ~0, got norm={}",
-            r_norm
+            "Residual at ground truth should be ~0, got norm={}, and residual {:?}",
+            r_norm,
+            r_gt
         );
 
         // --- Numeric Jacobian (central difference) ---
@@ -1359,18 +1367,19 @@ mod tests {
         let quat = UnitQuaternion::from_rotation_matrix(&na::Rotation3::from_matrix_unchecked(delta_r_mat));
         PreInt { dR: so3::SO3::new(quat), 
             dv: delta_v, dp: delta_p, 
-            cov: na::SMatrix::<f64, 9, 9>::identity(), dt, 
+            cov: na::SMatrix::<f64, 15, 15>::identity(), dt, 
             Jr_bg: na::SMatrix::<f64, 3, 3>::zeros(), 
             Jv_bg: na::SMatrix::<f64, 3, 3>::zeros(), 
             Jv_ba: na::SMatrix::<f64, 3, 3>::zeros(), 
-            Jp_bg: na::SMatrix::<f64, 3, 3>::zeros(), 
-            Jp_ba: na::SMatrix::<f64, 3, 3>::zeros(), 
+            linearized_bg: na::Vector3::<f64>::zeros(), 
+            linearized_ba: na::Vector3::<f64>::zeros(), 
             // gyro_random_walk: na::Vector3::<f64>::from_element(1.0), 
             // accel_random_walk: na::Vector3::<f64>::from_element(1.0), 
-            inv_chol: na::SMatrix::<f64, 9, 9>::identity(),
-            inv_chol_bias: na::SMatrix::<f64, 6, 6>::identity(),
+            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(),
+            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
         }
     }
 

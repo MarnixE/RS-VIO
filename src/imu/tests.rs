@@ -165,13 +165,15 @@ mod tests {
             let out2 = integrator.propagate(&imu_slice, &bias_a2, &bias_g);
 
             let fd_dv = (out2.dv - base.dv) / eps;
-            let col = base.Jv_ba.column(axis);
+            let Jv_ba = base.jacobian.fixed_view::<3, 3>(3, 9);
+            let col = Jv_ba.column(axis);
 
             println!("Finite difference dv wrt bias_a[{}]: {:?}", axis, fd_dv);
             assert!((fd_dv - col).norm() < 1e-4, "Jv_ba col {} mismatch", axis);
 
             let fd_dp = (out2.dp - base.dp) / eps;
-            let colp = base.Jp_ba.column(axis);
+            let Jp_ba = base.jacobian.fixed_view::<3, 3>(6, 9);
+            let colp = Jp_ba.column(axis);
             assert!((fd_dp - colp).norm() < 1e-4, "Jp_ba col {} mismatch", axis);
         }
 
@@ -182,13 +184,15 @@ mod tests {
             let out2 = integrator.propagate(&imu_slice, &bias_a, &bias_g2);
 
             let fd_dv = (out2.dv - base.dv) / eps;
-            let col = base.Jv_bg.column(axis);
+            let Jv_bg = base.jacobian.fixed_view::<3, 3>(3, 12);
+            let col = Jv_bg.column(axis);
 
             println!("Finite difference dv wrt bias_g[{}]: {:?}", axis, fd_dv);
             assert!((fd_dv - col).norm() < 1e-4, "Jv_bg col {} mismatch", axis);
 
             let fd_dp = (out2.dp - base.dp) / eps;
-            let colp = base.Jp_bg.column(axis);
+            let Jp_bg = base.jacobian.fixed_view::<3, 3>(6, 12);
+            let colp = Jp_bg.column(axis);
             assert!((fd_dp - colp).norm() < 1e-4, "Jp_bg col {} mismatch", axis);
         }
     }

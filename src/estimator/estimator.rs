@@ -300,7 +300,6 @@ impl<'a> Estimator<'a> {
 
                 let (g_refined, scale) = if result.is_ok() {
                     self.sliding_window.initialized = true;
-                    // panic!("Linear alignment succeeded. Refined gravity: {:?}, scale: {:.6}", result.as_ref().unwrap().0, result.as_ref().unwrap().1);
                     result.unwrap()
                 } else {
                     log::warn!("[Estimator] Linear alignment failed: {:?}. Using default gravity and scale.", result.err());

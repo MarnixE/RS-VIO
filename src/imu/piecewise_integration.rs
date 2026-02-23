@@ -23,14 +23,15 @@ pub struct PreInt {
     pub Jr_bg: na::Matrix3<f64>,
     pub Jv_bg: na::Matrix3<f64>,
     pub Jv_ba: na::Matrix3<f64>,
-    pub Jp_bg: na::Matrix3<f64>,
-    pub Jp_ba: na::Matrix3<f64>,
+    pub linearized_ba: na::Vector3<f64>,
+    pub linearized_bg: na::Vector3<f64>,
 
+    pub jacobian: na::SMatrix<f64, 15, 15>,
     // pub gyro_random_walk: na::Matrix3<f64>,
     // pub accel_random_walk: na::Matrix3<f64>,
 
-    pub inv_chol: Matrix15,
-    pub inv_chol_bias: na::Matrix6<f64>,
+    pub sqrt_info: Matrix15,
+    pub sqrt_info_bias: na::Matrix6<f64>,
 
     /// Buffers for repropagation
     pub imu_buffer: Vec<ImuData>,
@@ -69,20 +70,17 @@ impl PreInt {
             .try_inverse()
             .expect("Failed to invert Cholesky factor");
 
-        self.inv_chol = W.clone();
+        self.sqrt_info = W.clone();
     }
 
     pub fn whiten_residual_15(&self, r: &na::SVector<f64, 15>) -> na::SVector<f64, 15> {
-        self.inv_chol * r
+        self.sqrt_info * r
+        // self.sqrt_info.solve_lower_triangular(&r).unwrap()
     }
 
     pub fn whiten_jacobian_15<const N: usize>(&self, J: &na::SMatrix<f64, 15, N>) -> na::SMatrix<f64, 15, N> {
-        self.inv_chol * J
-        // let mat = na::stack![];
-        //     self.inv_chol, 0;
-        //     0, self.inv_chol_bias
-        // ];
-        // mat * J
+        self.sqrt_info * J
+        // self.sqrt_info.solve_lower_triangular(&J).unwrap()
     }
 }
 
@@ -92,8 +90,8 @@ pub struct ImuPiecewiseIntegration {
     T_BS: na::Matrix4<f64>,
     accel_noise_density: f64,
     gyro_noise_density: f64,
-    accel_random_walk: na::Matrix3<f64>,
-    gyro_random_walk: na::Matrix3<f64>,
+    accel_random_walk: f64,
+    gyro_random_walk: f64,
     imu_buffer: Vec<ImuData>,
     // preintegrated_noise: na::SVector<f64, 9>,
     pub gravity: na::Vector3<f64>,
@@ -109,8 +107,8 @@ impl ImuPiecewiseIntegration {
             T_BS: nalgebra::Matrix4::identity(),
             accel_noise_density: 1.0,
             gyro_noise_density: 1.0,
-            accel_random_walk: na::Matrix3::zeros(),
-            gyro_random_walk: na::Matrix3::zeros(),
+            accel_random_walk: 0.0,
+            gyro_random_walk: 0.0,
             imu_buffer: Vec::new(),
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
             // preintegrated_noise: na::SVector::<f64, 9>::zeros(),
@@ -123,8 +121,8 @@ impl ImuPiecewiseIntegration {
             T_BS: nalgebra::Matrix4::from_row_slice(&config.T_BS.data),
             accel_noise_density: config.accel_noise_density,
             gyro_noise_density: config.gyro_noise_density,
-            accel_random_walk: na::Matrix3::identity() * config.accel_random_walk.powi(2),
-            gyro_random_walk: na::Matrix3::identity() * config.gyro_random_walk.powi(2),
+            accel_random_walk: config.accel_random_walk,
+            gyro_random_walk: config.gyro_random_walk,
             imu_buffer: Vec::new(),
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
             // preintegrated_noise: na::SVector::<f64, 9>::from_element(1.0),
@@ -145,24 +143,24 @@ impl ImuPiecewiseIntegration {
         let mut Jr_bg = na::Matrix3::zeros();
         let mut Jv_bg = na::Matrix3::zeros();
         let mut Jv_ba = na::Matrix3::zeros();
-        let mut Jp_bg = na::Matrix3::zeros();
-        let mut Jp_ba = na::Matrix3::zeros();
+        // let mut Jp_bg = na::Matrix3::zeros();
+        // let mut Jp_ba = na::Matrix3::zeros();
+        
+        let mut jacobian = na::SMatrix::<f64, 15, 15>::identity();
 
-        let mut cov_ik = na::SMatrix::<f64, 15, 15>::zeros(); 
-
+        let mut cov_ik = na::SMatrix::<f64, 15, 15>::zeros();
         
 
         // let bias_g = biases.rows(0, 3);
         // let bias_a = biases.rows(3, 3);
         // let bias_g = self.gyro_random_walk; // Placeholder for gyro bias
         // let bias_a = self.accel_random_walk; // Placeholder for accel bias
-        log::warn!("Gravity in preintegration: {:?}", self.gravity);
+        // log::warn!("Gravity in preintegration: {:?}", self.gravity);
 
         // let mut delta_q = na::Quaternion::identity();
 
         for (i, imu) in imu_slice.iter().enumerate() {
             ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
-            // print!("Integrating IMU measurement {} at time {:.6} s\n", i, ts);
             let dt = ts - prev_ts;
             if dt <= 0.0 {
                 continue;
@@ -170,7 +168,7 @@ impl ImuPiecewiseIntegration {
             prev_ts = ts;
 
             let omega_unbiased = imu.gyro - bias_g;
-            let acc_unbiased = (imu.accel - bias_a);
+            let acc_unbiased = imu.accel - bias_a;
             // delta_q = na::Quaternion::new(1.0, 
             //     omega_unbiased[0] * dt / 2.0, 
             //     omega_unbiased[1] * dt / 2.0, 
@@ -179,7 +177,6 @@ impl ImuPiecewiseIntegration {
             let dphi = omega_unbiased  * dt; // Angular increment
             let dR_kkp1 = SO3::from_scaled_axis(dphi);
             let J_r = self.right_jacobian_so3(&dphi);
-            // print!("dt: {:.6}, dphi: {:?}, Jr:\n{}", dt, dphi, J_r);
 
             let dv_ikm1 = dv_ik.clone(); // Cache delta_v_i_k before updating it for the next iteration
             dv_ik += dR_ik.rotation_matrix() * acc_unbiased * dt;
@@ -193,17 +190,19 @@ impl ImuPiecewiseIntegration {
             // log::warn!("Cov ik: {:?}", cov_ik);
             cov_ik = A * cov_ik * A.transpose() + B * cov_eta * B.transpose(); // Propagate covariance
 
-            Jp_ba += Jv_ba * dt - 0.5 * dR_ik.rotation_matrix() * (dt*dt);
-            Jv_ba += -dR_ik.rotation_matrix() * dt;
+            // Jp_ba += Jv_ba * dt - 0.5 * dR_ik.rotation_matrix() * (dt*dt);
+            // Jv_ba += -dR_ik.rotation_matrix() * dt;
 
-            let a_hat = skew_symmetric(&acc_unbiased);
-            Jp_bg += Jv_bg * dt - 0.5 * dR_ik.rotation_matrix() * a_hat * Jr_bg * (dt*dt);
-            Jv_bg += -dR_ik.rotation_matrix() * a_hat * Jr_bg * dt;
+            // let a_hat = skew_symmetric(&acc_unbiased);
+            // Jp_bg += Jv_bg * dt - 0.5 * dR_ik.rotation_matrix() * a_hat * Jr_bg * (dt*dt);
+            // Jv_bg += -dR_ik.rotation_matrix() * a_hat * Jr_bg * dt;
 
-            let R_kkp1 = dR_kkp1.rotation_matrix();
-            Jr_bg = R_kkp1.transpose() * Jr_bg - J_r * dt;
+            // let R_kkp1 = dR_kkp1.rotation_matrix();
+            // Jr_bg = R_kkp1.transpose() * Jr_bg - J_r * dt;
 
             dR_ik = SO3::from_quaternion(dR_ik.quaternion() * dR_kkp1.quaternion());
+
+            jacobian = A * jacobian; // Update the Jacobian of the preintegrated measurement w.r.t. biases
         }
         
         let dt_step = ts - first_ts;
@@ -219,22 +218,23 @@ impl ImuPiecewiseIntegration {
                 Jr_bg: na::Matrix3::zeros(),
                 Jv_bg: na::Matrix3::zeros(),
                 Jv_ba: na::Matrix3::zeros(),
-                Jp_bg: na::Matrix3::zeros(),
-                Jp_ba: na::Matrix3::zeros(),
+                linearized_ba: na::Vector3::zeros(),
+                linearized_bg: na::Vector3::zeros(),
                 // gyro_random_walk: self.gyro_random_walk,
                 // accel_random_walk: self.accel_random_walk,
-                inv_chol: Matrix15::identity(), // Identity since covariance is near zero
-                inv_chol_bias: na::Matrix6::identity(), // Identity for bias as well
+                jacobian: na::SMatrix::<f64, 15, 15>::identity(),
+                sqrt_info: Matrix15::identity(), // Identity since covariance is near zero
+                sqrt_info_bias: na::Matrix6::identity(), // Identity for bias as well
                 imu_buffer: imu_slice.to_vec(), // Store the raw IMU data for potential repropagation
                 gravity: self.gravity, // Default gravity
             };
         }
 
-        let sigma = self.bias_rw_cov(dt_step, 
-            self.gyro_random_walk, 
-            self.accel_random_walk,
-        );
-
+        // let sigma = self.bias_rw_cov(dt_step, 
+        //     self.gyro_random_walk, 
+        //     self.accel_random_walk,
+        // );
+        // print!("Sqrt info:\n{:?}", self.compute_sqrt_info(&cov_ik));
         PreInt {
             dR: dR_ik,
             dv: dv_ik,
@@ -246,12 +246,13 @@ impl ImuPiecewiseIntegration {
             Jr_bg: Jr_bg, 
             Jv_bg: Jv_bg,
             Jv_ba: Jv_ba,
-            Jp_bg: Jp_bg, 
-            Jp_ba: Jp_ba, 
+            linearized_ba: bias_a.clone(), 
+            linearized_bg: bias_g.clone(), 
             // gyro_random_walk: self.gyro_random_walk,
             // accel_random_walk: self.accel_random_walk,
-            inv_chol: self.compute_inv_chol(&cov_ik), // Compute square root information matrix
-            inv_chol_bias: self.inv_chol_bias(&sigma), // Identity for bias as well
+            jacobian: jacobian,
+            sqrt_info: self.compute_sqrt_info(&cov_ik), // Compute square root information matrix
+            sqrt_info_bias: na::Matrix6::identity(), // Identity for bias as well
             imu_buffer: imu_slice.to_vec(), // Store the raw IMU data for potential repropagation
             gravity: self.gravity, // Default gravity
         }
@@ -324,9 +325,9 @@ impl ImuPiecewiseIntegration {
         let B_bg = I3 * dt;                   // b_g <- gyro-bias  RW noise
 
         na::stack![
-            B_phig, 0, 0, 0;
-            0, B_va, 0, 0;
-            0, B_pa, 0, 0;
+            0, B_phig, 0, 0;
+            B_va, 0, 0, 0;
+            B_pa, 0, 0, 0;
             0, 0, B_ba, 0;
             0, 0, 0, B_bg
         ]
@@ -341,45 +342,42 @@ impl ImuPiecewiseIntegration {
         let gyr_w = self.gyro_random_walk;         // GYR_W
 
         // Effective per-step noise for midpoint-averaged samples
-        let Qg = 0.5 * (gyr_n * gyr_n) * I3;   // n_omega
-        let Qa = 0.5 * (acc_n * acc_n) * I3;  // n_a
+        let Qa = (acc_n * acc_n) * I3;  // n_a
+        let Qg = (gyr_n * gyr_n) * I3;   // n_omega
 
         // Bias random walk noises (not averaged)
         let Qba = (acc_w * acc_w) * I3;        // n_ba
         let Qbg = (gyr_w * gyr_w) * I3;        // n_bg
 
         na::stack![
-            Qg, 0, 0, 0;
-            0, Qa, 0, 0;
+            Qa, 0, 0, 0;
+            0, Qg, 0, 0;
             0, 0, Qba, 0;
             0, 0, 0, Qbg
         ]
     }
 
-    pub fn compute_inv_chol(&self, sigma: &Matrix15) -> Matrix15 {
-        // 1) Symmetrize (numerical hygiene)
-        let sigma = 0.5 * (sigma + sigma.transpose());
+    pub fn compute_sqrt_info(&self, sigma: &Matrix15) -> Matrix15 {
+        let info = sigma.try_inverse().expect("Failed to invert bias covariance for sqrt info");
+        let chol_info = na::Cholesky::new(info);
+        let lw = chol_info.as_ref().unwrap().l();
 
-        // 2) Cholesky: Σ = L L^T
-        let sigma_reg = sigma + Matrix15::identity() * 1e-6;
-        let chol = na::Cholesky::new(sigma_reg);
-        let L = chol.as_ref().unwrap().l();
+        let sqrt_info = lw.transpose();
+        let diff = sqrt_info.transpose() * sqrt_info - info;
+        let max_diff = diff.iter().fold(0.0, |max, &val| val.abs().max(max));
 
-        // 3) sqrt_info = L^{-1}
-        L.try_inverse().expect("Failed to invert L")
+        let err_f = diff.norm();
+        let info_f = info.norm();
+        assert!(err_f / info_f < 1e-10);
+
+        sqrt_info
     }
 
-    pub fn inv_chol_bias(&self, sigma: &na::SMatrix<f64, 6, 6>) -> na::SMatrix<f64, 6, 6> {
-        // 1) Symmetrize (numerical hygiene)
-        let sigma = 0.5 * (sigma + sigma.transpose());
-
-        // 2) Cholesky: Σ = L L^T
-        let sigma_reg = sigma + na::SMatrix::<f64, 6, 6>::identity() * 1e-6;
-        let chol = na::Cholesky::new(sigma_reg);
-        let L = chol.as_ref().unwrap().l();
-
-        // 3) sqrt_info = L^{-1}
-        L.try_inverse().expect("Failed to invert L")
+    pub fn sqrt_info_bias(&self, sigma: &na::SMatrix<f64, 6, 6>) -> na::SMatrix<f64, 6, 6> {
+        let info = sigma.try_inverse().expect("Failed to invert bias covariance for sqrt info");
+        let chol_info = na::Cholesky::new(info);
+        let lw = chol_info.as_ref().unwrap().l();
+        lw.transpose() // Since info = L L^T, sqrt_info = L^T
     }
 
     fn bias_rw_cov(&self, dt: f64, q_ba: na::Matrix3<f64>, q_bg: na::Matrix3<f64>) -> na::Matrix6<f64> {

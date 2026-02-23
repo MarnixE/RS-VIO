@@ -153,6 +153,8 @@ impl SlidingWindow {
             .with_cost_tolerance(1e-6)
             .with_parameter_tolerance(1e-9)
             .with_jacobi_scaling(false)
+            .with_damping(1e-2)
+            .with_trust_region(0.2, 0.8, 0.1)
     }
 
     pub fn check_sliding_window_size_for_optimization(&self) -> Result<bool, std::io::Error> {
@@ -251,7 +253,7 @@ impl SlidingWindow {
         } else {
             500.0 // Default fallback value
         };
-        let sqrt_info = focal_length / 1.5 * na::Matrix2::identity();
+        let sqrt_info = na::Matrix2::identity() * focal_length / 1.5;
 
         // Add factors
         for (id_frame, frame) in self.keyframes.iter().enumerate() {
@@ -287,8 +289,8 @@ impl SlidingWindow {
             if id_frame > 0 && frame.imu_preintegration.is_some() && self.initialized {
                 let imu_factor = ImuFactor::new(
                     frame.imu_preintegration.as_ref().unwrap().clone(),
-                    frame.state.accel_bias,
-                    frame.state.gyro_bias,
+                    frame.imu_preintegration.as_ref().unwrap().linearized_ba.clone(),
+                    frame.imu_preintegration.as_ref().unwrap().linearized_bg.clone(),
                 );
                 
                 let var_names: Vec<&str> = vec![
@@ -684,7 +686,7 @@ impl SlidingWindow {
             let q_ij = na::UnitQuaternion::from_matrix(&(q_i.transpose() * q_j));
 
             let tmp_a = if frame_j.imu_preintegration.is_some() && frame_i.imu_preintegration.is_some() {
-                frame_j.imu_preintegration.as_ref().unwrap().Jr_bg
+                frame_j.imu_preintegration.as_ref().unwrap().jacobian.fixed_view::<3, 3>(0, 12).into_owned()
             } else {
                 log::error!("[SlidingWindow] Cannot solve gyroscope bias: missing IMU preintegration for frames {} and {}", frame_i.frame_id, frame_j.frame_id);
                 na::Matrix3::identity() // TODO handle this case properly, maybe return Result or Option
@@ -699,7 +701,6 @@ impl SlidingWindow {
         let mut bgs = Vec::new();
         let mut bga = Vec::new();
         for (id, frame) in self.keyframes.iter().enumerate() {
-            log::debug!("Frame {} gyro bias before: {:?}", frame.frame_id, frame.state.gyro_bias);
             let new_gyro_bias  = frame.state.gyro_bias + delta_bg;
             bgs.push(new_gyro_bias);
 
@@ -803,7 +804,7 @@ impl SlidingWindow {
         let s = solution[n_states - 1] / 100.0;
         let last_idx = solution.len() - 1;
         solution[last_idx] = s;
-        log::debug!("[Linear Alignment] Result g: {:?}, {:?}", g_refined.norm(), g_refined.transpose());
+        log::info!("[Linear Alignment] Result g: {:?}, {:?}", g_refined.norm(), g_refined.transpose());
 
         if s < 0.0 {
             log::warn!("[Linear Alignment] Negative scale factor from linear alignment, setting to 1.0");

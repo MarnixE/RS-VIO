@@ -418,10 +418,9 @@ impl EurocPlayer {
         } else {
             None
         };
-
+        
         // Process frame
         let imu_slice = imu_result.as_ref().map(|v| v.as_slice());
-        // print!("IMU slice for frame {}: ", context.current_idx);
 
         estimator.process_frame(
             &left_image,
