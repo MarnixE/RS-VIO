@@ -30,9 +30,9 @@ impl State {
             T_W_B: Matrix4x4::identity(),
             T_B_Cl: T_B_Cl,
             T_B_Cr: T_B_Cr,
-            velocity: velocity.unwrap_or(Vector3::zeros()),
-            accel_bias: accel_bias.unwrap_or(Vector3::zeros()),
-            gyro_bias: gyro_bias.unwrap_or(Vector3::zeros()),
+            velocity: velocity.unwrap_or(Vector3::from_element(0.001)),
+            accel_bias: accel_bias.unwrap_or(Vector3::from_element(0.001)),
+            gyro_bias: gyro_bias.unwrap_or(Vector3::from_element(0.001)),
         }
     }
 
@@ -42,9 +42,9 @@ impl State {
             T_W_B: Matrix4x4::identity(),
             T_B_Cl: Matrix4x4::identity(),
             T_B_Cr: Matrix4x4::identity(),
-            velocity: Vector3::zeros(),
-            accel_bias: Vector3::zeros(),
-            gyro_bias: Vector3::zeros(),
+            velocity: Vector3::from_element(0.001),
+            accel_bias: Vector3::from_element(0.001),
+            gyro_bias: Vector3::from_element(0.001),
         }
     }
 

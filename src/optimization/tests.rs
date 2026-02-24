@@ -855,23 +855,22 @@ mod tests {
         let qj = qi;
         let dR = so3::SO3::identity(); // must match your implementation
 
-        let preint = PreInt {
+        let preint = PreInt::new(
             dt,
             dR,
-            cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
-            dv: Vector3::zeros(),
-            dp: Vector3::zeros(),
-            Jr_bg: Matrix3::zeros(),
-            Jv_bg: Matrix3::zeros(),
-            Jv_ba: Matrix3::zeros(),
-            linearized_ba: Vector3::zeros(),
-            linearized_bg: Vector3::zeros(),
-            jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
-            sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
-            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
-            imu_buffer: Vec::new(), // not used
-            gravity: g,
-        };
+            Vector3::zeros(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            dt,
+            // Jr_bg: Matrix3::zeros(),
+            // Jv_bg: Matrix3::zeros(),
+            // Jv_ba: Matrix3::zeros(),
+            Vector3::zeros(),
+            Vector3::zeros(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            na::SMatrix::<f64, 6, 6>::identity(),
+            Vec::new(),
+            g,
+        );
 
         let factor = ImuFactor::new(preint, bai, bgi);
 

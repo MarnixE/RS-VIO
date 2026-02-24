@@ -101,6 +101,14 @@ impl SlidingWindow {
         true
     }
 
+    pub fn update_gravity(&mut self, gravity: Vector3) {
+        for frame in self.keyframes.iter_mut() {
+            if let Some(imu_preintegration) = &mut frame.imu_preintegration {
+                imu_preintegration.gravity = gravity;
+            }
+        }
+    }
+
     /// Get the current number of keyframes in the window.
     pub fn len(&self) -> usize {
         self.keyframes.len()
@@ -152,9 +160,9 @@ impl SlidingWindow {
             .with_max_iterations(20)
             .with_cost_tolerance(1e-6)
             .with_parameter_tolerance(1e-9)
-            .with_jacobi_scaling(false)
-            .with_damping(1e-2)
-            .with_trust_region(0.2, 0.8, 0.1)
+            .with_jacobi_scaling(true)
+            .with_damping(1e3)
+            // .with_trust_region(0.2, 0.8, 0.1)
     }
 
     pub fn check_sliding_window_size_for_optimization(&self) -> Result<bool, std::io::Error> {
@@ -286,7 +294,7 @@ impl SlidingWindow {
                 (&frame.right_features, T_Cr_B),
             ];
             
-            if id_frame > 0 && frame.imu_preintegration.is_some() && self.initialized {
+            if id_frame > 0 && frame.imu_preintegration.is_some() && self.initialized && frame.imu_preintegration.clone().unwrap().dt < 10.0 {
                 let imu_factor = ImuFactor::new(
                     frame.imu_preintegration.as_ref().unwrap().clone(),
                     frame.imu_preintegration.as_ref().unwrap().linearized_ba.clone(),
@@ -299,7 +307,7 @@ impl SlidingWindow {
                     &kf_var,     // Current keyframe pose
                     &vb_var,     // Current keyframe velocity and biases
                 ];
-                let huber_loss = HuberLoss::new(3.0).unwrap();
+                let huber_loss = HuberLoss::new(2.0).unwrap();
                 problem.add_residual_block(&var_names, 
                     Box::new(imu_factor), Some(Box::new(huber_loss)));
             };
@@ -689,7 +697,8 @@ impl SlidingWindow {
                 frame_j.imu_preintegration.as_ref().unwrap().jacobian.fixed_view::<3, 3>(0, 12).into_owned()
             } else {
                 log::error!("[SlidingWindow] Cannot solve gyroscope bias: missing IMU preintegration for frames {} and {}", frame_i.frame_id, frame_j.frame_id);
-                na::Matrix3::identity() // TODO handle this case properly, maybe return Result or Option
+                // na::Matrix3::identity() // TODO handle this case properly, maybe return Result or Option
+                continue;
             };
             let tmp_b = 2.0 * (frame_j.imu_preintegration.as_ref().unwrap().dR.quaternion().inverse() * q_ij).vector();
 

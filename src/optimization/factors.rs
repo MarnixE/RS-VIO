@@ -698,16 +698,17 @@ impl Factor for ImuFactor {
         let bg_i = params[1].rows(6, 3).clone_owned();
         let bg_j = params[3].rows(6, 3).clone_owned();
 
-        // log::info!("Acceleration bias i: {:?}, j: {:?}", ba_i, ba_j);
+        log::info!("Acceleration bias i: {:?}, j: {:?}", ba_i, ba_j);
 
         // log::info!("Linearized bias acceleration: {:?}, {}", self.linearized_bias_a, compute_jacobian);
-        if ba_i.norm() > 1.0 || ba_j.norm() > 1.0 {
-            panic!("Acceleration bias too large: ba_i = {:?}, ba_j = {:?}", ba_i, ba_j);
+        if ba_i.norm() > 5.0 || ba_j.norm() > 5.0 {
+            // panic!("Acceleration bias too large: ba_i = {:?}, ba_j = {:?}, v_i = {:?}, v_j = {:?}", ba_i, ba_j, v_i, v_j);
+            // return (DVector::from_vec(vec![1e6; 15]), None);
         }
 
         // log::error!("Bias and g in factor: ba_i = {:?}, ba_j = {:?}, bg_i = {:?}, bg_j = {:?}", ba_i, ba_j, bg_i, bg_j);
-        let db_a = ba_i.clone() - self.linearized_bias_a;
-        let db_g = bg_i.clone() - self.linearized_bias_g;
+        let db_a: na::Vector3<f64> = ba_i.clone() - self.linearized_bias_a; // + 1e-9 * na::Vector3::new(1.0, 1.0, 1.0); // add small value to avoid singularity
+        let db_g: na::Vector3<f64> = bg_i.clone() - self.linearized_bias_g; //+ 1e-9 * na::Vector3::new(1.0, 1.0, 1.0); // add small value to avoid singularity
 
         let g_w = self.preint.gravity;
         
@@ -715,6 +716,10 @@ impl Factor for ImuFactor {
         let R_j = T_B_W_j.rotation_so3();
         let t_i = T_B_W_i.translation();
         let t_j = T_B_W_j.translation();
+
+        let dt = self.preint.dt;
+        let a_v = v_j.clone() - v_i.clone() + g_w.clone() * dt;
+        let a_p = t_j - t_i - v_i.clone() * dt + 0.5 * g_w.clone() * dt * dt;
 
         let dR_dbg = self.preint.jacobian.fixed_view::<3,3>(0, 12).clone();
         let phi_b = dR_dbg * db_g;
@@ -735,8 +740,8 @@ impl Factor for ImuFactor {
         let dp_dbg = self.preint.jacobian.fixed_view::<3,3>(6, 12).clone();
 
         // // Residual w.r.t. velocity and position
-        let dv_corr = self.preint.dv + dv_dbg * db_g.clone() + dv_dba * db_a.clone();
-        let dp_corr = self.preint.dp + dp_dbg * db_g + dp_dba * db_a;
+        let dv_corr = self.preint.dv + dv_dbg * db_g.clone() + dv_dba.clone() * db_a.clone();
+        let dp_corr = self.preint.dp + dp_dbg * db_g + dp_dba.clone() * db_a.clone();
 
         // Residual w.r.t. rotation
         let residual_dR = dR_corr.inverse(None)
@@ -744,12 +749,11 @@ impl Factor for ImuFactor {
             .compose(&R_j, None, None).log(None);
 
         // let R_i_inv: Matrix3<f64> = R_i.inverse(None).rotation_matrix().into();
-        let RiT = R_i.rotation_matrix().transpose();
-        // let v_diff = v_j.clone() - v_i.clone() - g_w.clone() * self.preint.dt;
+        let RiT = R_i.inverse(None).rotation_matrix();
         let v_diff = g_w.clone() * self.preint.dt + v_j.clone() - v_i.clone();
         
         let residual_dv = RiT * v_diff - dv_corr;
-        let residual_dp = RiT * (T_B_W_j.translation() - T_B_W_i.translation() - v_i.clone() * self.preint.dt 
+        let residual_dp = RiT * (T_B_W_j.inverse(None).translation() - T_B_W_i.inverse(None).translation() - v_i.clone() * self.preint.dt 
             + 0.5 * g_w.clone() * self.preint.dt * self.preint.dt) - dp_corr;
         let residual_bg = bg_j.clone() - bg_i.clone();
         let residual_ba = ba_j.clone() - ba_i.clone();
@@ -760,7 +764,6 @@ impl Factor for ImuFactor {
         //     v.rows_mut(3, 3).copy_from(&(bg_j - bg_i));
         //     v
         // };
-        
         // Convert SO3Tangent to DVector
         let residual_dR_vec: DVector<f64> = residual_dR.clone().into();
 
@@ -792,10 +795,13 @@ impl Factor for ImuFactor {
         // residuals_whitened_combined.rows_mut(9, 6).copy_from(&residuals_bias_whitened);
 
         let residuals = DVector::from_vec(residuals_whitened.as_slice().to_vec());
-        
-        let dt = self.preint.dt;
-        let a_v = v_j.clone() - v_i.clone() + g_w.clone() * dt;
-        let a_p = t_j - t_i - v_i.clone() * dt + 0.5 * g_w.clone() * dt * dt;
+
+        let v_diff = v_j.clone() - v_i.clone();
+        let grav_vel = g_w * self.preint.dt;
+
+        // print!("Bias diffs dv_dba = {:?}, dp_dba = {:?}, db_a = {:?}\n", dv_dba.clone_owned(), dp_dba.clone_owned(), db_a);
+        // print!("Velocity diff and gravity term: v_diff = {:?}, gravity_vel = {:?}, dt = {:?}, dv = {:?}\n", v_diff, grav_vel, self.preint.dt, self.preint.dv);
+        print!("Residuals IMU factor: r_dR = {:?}, r_dv = {:?}, r_dp = {:?}, r_ba = {:?}, r_bg = {:?}\n", residual_dR_vec, residual_dv, residual_dp, residual_ba, residual_bg);
 
         // log::debug!("[Optimization]: dt {:?}", dt);
 
@@ -853,6 +859,9 @@ impl Factor for ImuFactor {
             J.fixed_view_mut::<3,3>(9, 24).copy_from(&na::Matrix3::identity());    // ba_j
             J.fixed_view_mut::<3,3>(12, 12).copy_from(&(-na::Matrix3::identity()));  // bg_i
             J.fixed_view_mut::<3,3>(12, 27).copy_from(&na::Matrix3::identity());   // bg_j
+
+            print!("Jacobian velocity blocks: dv_dphi = {:?}, dv_dv_i = {:?}, dv_dv_j = {:?}, dv_dba_i = {:?}, dv_dbg_i = {:?}\n", 
+                J.fixed_view::<3,3>(3, 0).clone_owned(), J.fixed_view::<3,3>(3, 3).clone_owned(), J.fixed_view::<3,3>(3, 18).clone_owned(), J.fixed_view::<3,3>(3, 9).clone_owned(), J.fixed_view::<3,3>(3, 12).clone_owned());
 
             Some(J)
         } else {

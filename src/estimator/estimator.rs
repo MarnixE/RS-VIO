@@ -50,6 +50,7 @@ pub struct Estimator<'a> {
     accel_biases: Vec<Vector3>,
 
     imu_buffer: Vec<ImuData>, // Buffer to store incoming IMU data for preintegration
+    first_frame: bool, // Flag to indicate if the current frame is the first frame (used for initialization)
 }
 
 impl<'a> Estimator<'a> {
@@ -116,6 +117,7 @@ impl<'a> Estimator<'a> {
             gyro_biases: Vec::new(),
             accel_biases: Vec::new(),
             imu_buffer: Vec::new(),
+            first_frame: true,
         }
     }
 
@@ -279,12 +281,16 @@ impl<'a> Estimator<'a> {
             log::error!("IMU buffer size before preintegration: {}", self.imu_buffer.len());
             let imu_preint = self.piecewise_integration.propagate(
                 &self.imu_buffer,
-                &self.accel_biases.last().unwrap_or(&Vector3::zeros()), // TODO: safeguard against empty history
-                &self.gyro_biases.last().unwrap_or(&Vector3::zeros()),
+                &self.accel_biases.last().unwrap_or(&Vector3::from_element(1e-4)), // TODO: safeguard against empty history
+                &self.gyro_biases.last().unwrap_or(&Vector3::from_element(1e-4)),
             );
             self.imu_buffer.clear(); // Clear the buffer after preintegration
             
+            // if !self.first_frame {
+            //     self.first_frame = false;
+            // } else {
             current_frame.add_imu_preint(imu_preint);
+            // }
             imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
 
             let optimization_start = Instant::now();
@@ -306,6 +312,8 @@ impl<'a> Estimator<'a> {
                     (na::Vector3::<f64>::new(0.0, 0.0, -9.81), 1.0)
                 };
                 self.piecewise_integration.gravity = g_refined;
+                
+                self.sliding_window.update_gravity(g_refined);
             }
         }
         
