@@ -90,6 +90,7 @@ impl Frame {
         velocity: Option<Vector3>,
         accel_bias: Option<Vector3>,
         gyro_bias: Option<Vector3>,
+        angular_velocity: Option<Vector3>,
     ) -> Self {
         Self {
             timestamp_ns,
@@ -97,7 +98,7 @@ impl Frame {
             frame_type: FrameType::Stereo,
             left_cam,
             right_cam,
-            state: State::new(T_B_Cl, T_B_Cr, velocity, accel_bias, gyro_bias),
+            state: State::new(T_B_Cl, T_B_Cr, velocity, accel_bias, gyro_bias, angular_velocity),
             imu_from_last_frame: Vec::new(),
             imu_since_last_keyframe: Vec::new(),
             is_keyframe: true,
@@ -152,8 +153,9 @@ impl Frame {
         self.right_features.push(feature);
     }
 
-    pub fn add_imu_preint(&mut self, imu_data: PreInt) {
-        self.imu_preintegration = Some(imu_data);
+    pub fn add_imu(&mut self, imu_preint: PreInt) {
+        self.imu_preintegration = Some(imu_preint);
+
     }
 }
 

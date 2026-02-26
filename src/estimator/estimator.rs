@@ -10,6 +10,8 @@ use camera_intrinsic_model::GenericModel;
 use image::{DynamicImage, GrayImage};
 use anyhow::Result;
 use nalgebra::{self as na, Vector6};
+use core::panic;
+use std::thread::current;
 use std::time::Instant;
 use crate::estimator::sliding_window::SlidingWindow;
 use crate::datasets::CameraModelType;
@@ -43,8 +45,9 @@ pub struct Estimator<'a> {
     trajectory: Vec<Matrix4x4>,
     // IMU piecewise integration module
     piecewise_integration: ImuPiecewiseIntegration,
-    // IMU biases
+    // Velocities
     velocities: Vec<Vector3>,
+    angular_velocities: Vec<Vector3>,
     // IMU biases
     gyro_biases: Vec<Vector3>,
     accel_biases: Vec<Vector3>,
@@ -115,6 +118,7 @@ impl<'a> Estimator<'a> {
             trajectory: Vec::new(),
             piecewise_integration: piecewise_integration,
             velocities: Vec::new(),
+            angular_velocities: Vec::new(),
             gyro_biases: Vec::new(),
             accel_biases: Vec::new(),
             imu_buffer: Vec::new(),
@@ -198,9 +202,9 @@ impl<'a> Estimator<'a> {
         */
         log::info!(
             "[Estimator] Last velocity: {:?}, Last accel bias: {:?}, Last gyro bias: {:?}",
-            self.velocities.last(),
-            self.accel_biases.last(),
-            self.gyro_biases.last()
+            self.sliding_window.get_keyframe_velocities().and_then(|v| v.last().copied()),
+            self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.last().copied()),
+            self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.last().copied())
         );
 
         // Create frame (images are not stored, only features will be added)
@@ -211,9 +215,10 @@ impl<'a> Estimator<'a> {
             self.right_cam.clone(),
             self.T_B_Cl,
             self.T_B_Cr,
-            self.velocities.last().copied(),
-            self.accel_biases.last().copied(),
-            self.gyro_biases.last().copied(),
+            self.sliding_window.get_keyframe_velocities().and_then(|v| v.last().copied()),
+            self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.last().copied()),
+            self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.last().copied()),
+            self.sliding_window.get_angular_velocities().and_then(|v| v.last().copied())
         );
 
         // Attach IMU measurements if available.
@@ -281,37 +286,34 @@ impl<'a> Estimator<'a> {
         if current_frame.is_keyframe {
             let imu_start = Instant::now();
 
-            let init_rotation = if self.first_imu {
+            let init_rotation = if self.first_imu && imu_data.is_some() {
                 Some(self.process_first_imu(&imu_data.unwrap()))
             } else {
                 None
             };
-            if init_rotation.is_some() {
-                self.imu_buffer.clear();
-            }
+            
 
             log::error!("IMU buffer size before preintegration: {}", self.imu_buffer.len());
-            let imu_preint = self.piecewise_integration.propagate(
+             if init_rotation.is_some() {
+                current_frame.state.T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&init_rotation.unwrap());
+                
+            }
+            self.piecewise_integration.propagate(
                 &self.imu_buffer,
-                &self.accel_biases.last().unwrap_or(&Vector3::from_element(1e-4)), // TODO: safeguard against empty history
-                &self.gyro_biases.last().unwrap_or(&Vector3::from_element(1e-4)),
+                &mut current_frame,
+                &None,
+            &None,
             );
+
             self.imu_buffer.clear(); // Clear the buffer after preintegration
             if let Some(imu_data) = imu_data {
                 self.imu_buffer.extend_from_slice(imu_data);
             }
             
-            current_frame.add_imu_preint(imu_preint);
-            // }
+            // current_frame.add_imu(imu_preint);
             imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
-
             let optimization_start = Instant::now();
             self.sliding_window.add_frame(current_frame);
-            if init_rotation.is_some() {
-                self.sliding_window.set_initial_rotation(init_rotation.unwrap());
-            } else {
-                
-            }
             self.sliding_window.optimize(); // TODO handle error
             optimization_time_ms = optimization_start.elapsed().as_secs_f64() * 1000.0;
             self.view_optimization_results();
@@ -323,8 +325,8 @@ impl<'a> Estimator<'a> {
 
                 let (g_refined, scale) = if result.is_ok() {
                     self.sliding_window.initialized = true;
-                    // let (g_refined, scale) = result.unwrap();
-                    // panic!("Gravity and Scale are: {:?}, {}", g_refined, scale);
+                    let (g_refined, scale) = result.unwrap();
+                    panic!("Gravity and Scale are: {:?}, {}", g_refined, scale);
                     result.unwrap()
                 } else {
                     log::warn!("[Estimator] Linear alignment failed: {:?}. Using default gravity and scale.", result.err());
@@ -371,6 +373,7 @@ impl<'a> Estimator<'a> {
         log::info!("[Estimator] Average accel from first IMU batch: {:?}", avg_accel);
 
         let init_rotation = self.gravity_to_rotation(&avg_accel);
+        log::info!("[Estimator] Initial rotation from gravity: \n{}", init_rotation);
         init_rotation
     }
 
@@ -486,14 +489,25 @@ impl<'a> Estimator<'a> {
             };
             self.trajectory.push(mat);
 
-            let vel = self.sliding_window.get_keyframe_velocities().first().unwrap().clone();
-            self.velocities.push(vel);
+            let vel = self.sliding_window.get_keyframe_velocities().and_then(|v| v.first().copied());
+            if let Some(vel) = vel {
+                self.velocities.push(vel);
+            }
 
-            let ba = self.sliding_window.get_keyframe_accel_bias().first().unwrap().clone();
-            self.accel_biases.push(ba);
+            let ba = self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.first().copied());
+            if let Some(ba) = ba {
+                self.accel_biases.push(ba);
+            }
 
-            let bg = self.sliding_window.get_keyframe_gyro_bias().first().unwrap().clone();
-            self.gyro_biases.push(bg);
+            let bg = self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.first().copied());
+            if let Some(bg) = bg {
+                self.gyro_biases.push(bg);
+            }
+
+            let ang_vel = self.sliding_window.get_angular_velocities().and_then(|v| v.first().copied());
+            if let Some(ang_vel) = ang_vel {
+                self.angular_velocities.push(ang_vel);
+            }
             
             // Display trajectory as a continuous 3D path
             v.log_trajectory(&self.trajectory, "trajectory/path");

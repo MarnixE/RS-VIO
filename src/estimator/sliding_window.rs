@@ -138,16 +138,36 @@ impl SlidingWindow {
         self.keyframes.iter().map(|f| f.state.T_W_B).collect()
     }
 
-    pub fn get_keyframe_velocities(&self) -> Vec<Vector3> {
-        self.keyframes.iter().map(|f| f.state.velocity).collect()
+    pub fn get_keyframe_velocities(&self) -> Option<Vec<Vector3>> {
+        if self.keyframes.is_empty() {
+            None
+        } else {
+            Some(self.keyframes.iter().map(|f| f.state.velocity).collect())
+        }
     }
 
-    pub fn get_keyframe_accel_bias(&self) -> Vec<Vector3> {
-        self.keyframes.iter().map(|f| f.state.accel_bias).collect()
+    pub fn get_keyframe_accel_bias(&self) -> Option<Vec<Vector3>> {
+        if self.keyframes.is_empty() {
+            None
+        } else {
+            Some(self.keyframes.iter().map(|f| f.state.accel_bias).collect())
+        }
     }
 
-    pub fn get_keyframe_gyro_bias(&self) -> Vec<Vector3> {
-        self.keyframes.iter().map(|f| f.state.gyro_bias).collect()
+    pub fn get_keyframe_gyro_bias(&self) -> Option<Vec<Vector3>> {
+        if self.keyframes.is_empty() {
+            None
+        } else {
+            Some(self.keyframes.iter().map(|f| f.state.gyro_bias).collect())
+        }
+    }
+
+    pub fn get_angular_velocities(&self) -> Option<Vec<Vector3>> {
+        if self.keyframes.is_empty() {
+            None
+        } else {
+            Some(self.keyframes.iter().map(|f| f.state.angular_velocity).collect())
+        }
     }
 
     /// Clear all keyframes from the sliding window.
@@ -721,21 +741,11 @@ impl SlidingWindow {
         }
 
         // Collect data before mutating self.keyframes
-        let updates: Vec<(usize, Option<_>)> = self.keyframes.iter().enumerate()
-            .filter_map(|(id, frame)| {
-                if let Some(preint) = frame.imu_preintegration.as_ref() {
-                    let updated_preint = imu_preintegrator.repropagate(&bga[id], &bgs[id]);
-                    Some((id, Some(updated_preint)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (id, updated_preint) in updates {
-            self.keyframes[id].imu_preintegration = updated_preint;
-            self.keyframes[id].state.gyro_bias = bgs[id];
-            self.keyframes[id].state.accel_bias = bga[id];
+        for (id, frame) in self.keyframes.iter_mut().enumerate() {
+            imu_preintegrator.repropagate(
+                &bga[id], 
+                &bgs[id], 
+                frame);
         }
         bgs
     }

@@ -1,10 +1,11 @@
 use std::fmt;
 
-use crate::{datasets::{ImuData, config}, imu, types::Vector3};
+use crate::{datasets::{ImuData, config}, estimator::state, imu, types::Vector3};
 use faer::{row, traits::math_utils::sqrt};
 use imageproc::noise;
 use nalgebra::{self as na, Cholesky, SymmetricEigen};
 use apex_solver::manifold::{LieGroup, so3::SO3};
+use crate::estimator::Frame;
 
 // type Matrix6 = na::SMatrix<f64, 6, 6>;
 type Matrix15 = na::SMatrix<f64, 15, 15>;
@@ -164,7 +165,12 @@ impl ImuPiecewiseIntegration {
     }
 
     #[allow(non_snake_case)]
-    pub fn propagate(&mut self, imu_slice: &[ImuData], bias_a: &Vector3, bias_g: &Vector3) -> PreInt {
+    pub fn propagate(&mut self, imu_slice: &[ImuData], current_frame: &mut Frame, new_bias_a: &Option<Vector3>, new_bias_g: &Option<Vector3>) {
+        if (imu_slice.is_empty()) {
+            log::warn!("No IMU data to propagate");
+            return;
+        }
+
         self.imu_buffer = imu_slice.to_vec(); // Store the IMU data for repropagation
         let mut prev_ts = imu_slice.first().map_or(0.0, |imu| imu.timestamp as f64 * 1e-9); // Initialize prev_timestamp to the timestamp of the first IMU measurement
         let first_ts = prev_ts.clone();
@@ -177,9 +183,19 @@ impl ImuPiecewiseIntegration {
         let mut jacobian = na::SMatrix::<f64, 15, 15>::identity();
 
         let mut cov_ik = na::SMatrix::<f64, 15, 15>::zeros();
-        
 
-        for (i, imu) in imu_slice.iter().enumerate() {
+        let state = &current_frame.state;
+        
+        let mut R_wb = state.T_W_B.fixed_view::<3, 3>(0, 0).clone_owned(); // Rotation world from body
+        let mut t_wb = state.T_W_B.fixed_view::<3, 1>(0, 3).clone_owned(); // Translation world from body
+        let mut v = state.velocity; // Initial velocity in world frame
+        let bias_a = new_bias_a.unwrap_or(state.accel_bias); // linearlized accel bias (assume constant during preintegration)
+        let bias_g = new_bias_g.unwrap_or(state.gyro_bias); // linearlized gyro bias (assume constant during preintegration)
+
+        let mut acc_0 = imu_slice.first().map_or(na::Vector3::zeros(), |imu| imu.accel);
+        let mut gyr_0 = imu_slice.first().map_or(na::Vector3::zeros(), |imu| imu.gyro);
+
+        for (i, imu) in imu_slice.iter().enumerate().skip(1) {
             ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
             let dt = ts - prev_ts;
             if dt <= 0.0 {
@@ -187,8 +203,10 @@ impl ImuPiecewiseIntegration {
             }
             prev_ts = ts;
 
-            let acc_unbiased = imu.accel - bias_a;
-            let omega_unbiased = imu.gyro - bias_g;
+            // let acc_unbiased = imu.accel - bias_a;
+            // let omega_unbiased = imu.gyro - bias_g;
+            let acc_unbiased = acc_0 - bias_a; // Bias-corrected acceleration
+            let omega_unbiased = gyr_0 - bias_g; // Bias-corrected
 
             let dphi = omega_unbiased  * dt; // Angular increment
             let axis = na::Unit::new_normalize(dphi);
@@ -206,38 +224,55 @@ impl ImuPiecewiseIntegration {
             let noise = self.compute_noise(dt);
 
             cov_ik = A * cov_ik * A.transpose() + B * noise * B.transpose(); // Propagate covariance
-            
 
             dR_ik = SO3::from_quaternion(dR_ik.quaternion() * dR_kkp1.quaternion());
 
             jacobian = A * jacobian; // Update the Jacobian of the preintegrated measurement w.r.t. biases
+
+            // Update the state
+            let acc_w_un = R_wb * (acc_0 - bias_a);
+            let acc_unbiased_world = R_wb * (acc_0 - bias_a) + self.gravity; // Transform acceleration to world frame for bias correction
+            let omega_unbiased_world = gyr_0 - bias_g; // Angular velocity in world frame for bias correction
+            R_wb *= SO3::from_scaled_axis(omega_unbiased_world * dt).rotation_matrix();
+            t_wb += v * dt + 0.5 * acc_unbiased_world * dt * dt;
+            v += acc_unbiased_world * dt;
+            acc_0 = imu.accel;
+            gyr_0 = imu.gyro;
+            let a = 10;
         }
+
+        let mut T_W_B = na::Matrix4::<f64>::identity();
+        T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&R_wb);
+        T_W_B.fixed_view_mut::<3, 1>(0, 3).copy_from(&t_wb);
+
+        print!("Final T_W_B: \n{:?}\n", T_W_B);
+        print!("Final velocity: \n{:?}\n", v);
+
+        // print!("Final T_W_B: {:?}", T_W_B);
+        current_frame.state.T_W_B = T_W_B.try_into().expect("Failed to convert T_W_B to Matrix4x4");
+        current_frame.state.velocity = v;
+
         
         let dt_step = ts - first_ts;
 
         if dt_step <= 0.0 {
             log::warn!("Invalid time interval for preintegration: dt_step = {}", dt_step);
-            return PreInt::new(
-                SO3::identity(),
-                na::Vector3::zeros(),
-                na::Vector3::zeros(),
-                Matrix15::identity() * 1e-6, // Small covariance to avoid singularity
-                dt_step,
-                na::Vector3::zeros(),
-                na::Vector3::zeros(),
-                na::SMatrix::<f64, 15, 15>::identity(),
-                Matrix15::identity(), // Identity since covariance is near zero
-                imu_slice, // Store the raw IMU data for potential repropagation
-                self.gravity,
-            )
+            // return PreInt::new(
+            //     SO3::identity(),
+            //     na::Vector3::zeros(),
+            //     na::Vector3::zeros(),
+            //     Matrix15::identity() * 1e-6, // Small covariance to avoid singularity
+            //     dt_step,
+            //     na::Vector3::zeros(),
+            //     na::Vector3::zeros(),
+            //     na::SMatrix::<f64, 15, 15>::identity(),
+            //     Matrix15::identity(), // Identity since covariance is near zero
+            //     imu_slice, // Store the raw IMU data for potential repropagation
+            //     self.gravity,
+            // )
         }
-
-        // let sigma = self.bias_rw_cov(dt_step, 
-        //     self.gyro_random_walk, 
-        //     self.accel_random_walk,
-        // );
-        // print!("Sqrt info:\n{:?}", self.compute_sqrt_info(&cov_ik));
-        PreInt::new(
+        
+        let preint = PreInt::new(
             dR_ik,
             dv_ik,
             dp_ik,
@@ -254,14 +289,16 @@ impl ImuPiecewiseIntegration {
             // sqrt_info_bias: na::Matrix6::identity(), // Identity for bias as well
             imu_slice, // Store the raw IMU data for potential repropagation
             self.gravity, // Default gravity
-        )
+        );
+
+        current_frame.imu_preintegration = Some(preint);
     }
 
-    pub fn repropagate(&mut self, new_bias_a: &Vector3, new_bias_g: &Vector3) -> PreInt {
+    pub fn repropagate(&mut self, new_bias_a: &Vector3, new_bias_g: &Vector3, current_frame: &mut Frame) {
         let imu_slice = self.imu_buffer.clone(); // Get the original IMU data slice
         
         // Re-run the propagate function with the stored IMU data and new biases
-        self.propagate(&imu_slice, new_bias_a, new_bias_g)
+        self.propagate(&imu_slice, current_frame, &Some(new_bias_a.clone()), &Some(new_bias_g.clone()))
     }
 
     fn right_jacobian_so3(&self, phi: &na::Vector3<f64>) -> na::Matrix3<f64> {
