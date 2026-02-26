@@ -137,7 +137,7 @@ mod tests {
         // Rotation: compare on tangent spacee
         let dphi = dR_ref.inverse(None).compose(&out.dR, None, None).log(None); // implement log()->Vector3
         assert!(dphi.coeffs().norm() < 1e-10);
-
+        
         assert!((out.dv - dv_ref).norm() < 1e-10);
         assert!((out.dp - dp_ref).norm() < 1e-10);
 

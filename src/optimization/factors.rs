@@ -1,3 +1,4 @@
+use clap::Id;
 use faer::linalg::jacobi;
 use nalgebra::{self as na, Rotation3, dvector};
 use na::{DVector, DMatrix, Vector3, Vector2, Matrix4, UnitQuaternion, Matrix3};
@@ -698,17 +699,17 @@ impl Factor for ImuFactor {
         let bg_i = params[1].rows(6, 3).clone_owned();
         let bg_j = params[3].rows(6, 3).clone_owned();
 
-        log::info!("Acceleration bias i: {:?}, j: {:?}", ba_i, ba_j);
+        let idx_r = self.preint.idx_r;
+        let idx_v = self.preint.idx_v;
+        let idx_p = self.preint.idx_p;
+        let idx_ba = self.preint.idx_ba;
+        let idx_bg = self.preint.idx_bg;
 
-        // log::info!("Linearized bias acceleration: {:?}, {}", self.linearized_bias_a, compute_jacobian);
-        if ba_i.norm() > 5.0 || ba_j.norm() > 5.0 {
-            // panic!("Acceleration bias too large: ba_i = {:?}, ba_j = {:?}, v_i = {:?}, v_j = {:?}", ba_i, ba_j, v_i, v_j);
-            // return (DVector::from_vec(vec![1e6; 15]), None);
-        }
+        // let T_B_W_i = T_B_W_i.inverse(None);
+        // let T_B_W_j = T_B_W_j.inverse(None);
 
-        // log::error!("Bias and g in factor: ba_i = {:?}, ba_j = {:?}, bg_i = {:?}, bg_j = {:?}", ba_i, ba_j, bg_i, bg_j);
-        let db_a: na::Vector3<f64> = ba_i.clone() - self.linearized_bias_a; // + 1e-9 * na::Vector3::new(1.0, 1.0, 1.0); // add small value to avoid singularity
-        let db_g: na::Vector3<f64> = bg_i.clone() - self.linearized_bias_g; //+ 1e-9 * na::Vector3::new(1.0, 1.0, 1.0); // add small value to avoid singularity
+        let db_a: na::Vector3<f64> = ba_i.clone() - self.linearized_bias_a; 
+        let db_g: na::Vector3<f64> = bg_i.clone() - self.linearized_bias_g;
 
         let g_w = self.preint.gravity;
         
@@ -717,11 +718,12 @@ impl Factor for ImuFactor {
         let t_i = T_B_W_i.translation();
         let t_j = T_B_W_j.translation();
 
+        // Compute the relative acceleration and position from i to j, corrected for gravity and bias
         let dt = self.preint.dt;
         let a_v = v_j.clone() - v_i.clone() + g_w.clone() * dt;
         let a_p = t_j - t_i - v_i.clone() * dt + 0.5 * g_w.clone() * dt * dt;
 
-        let dR_dbg = self.preint.jacobian.fixed_view::<3,3>(0, 12).clone();
+        let dR_dbg = self.preint.jacobian.fixed_view::<3,3>(idx_r, idx_bg).clone();
         let phi_b = dR_dbg * db_g;
         
         // let delta_bg = self.preint.Jr_bg * db_g.clone();
@@ -734,13 +736,13 @@ impl Factor for ImuFactor {
             None
         );
 
-        let dv_dba = self.preint.jacobian.fixed_view::<3,3>(3, 9).clone();
-        let dv_dbg = self.preint.jacobian.fixed_view::<3,3>(3, 12).clone();
-        let dp_dba = self.preint.jacobian.fixed_view::<3,3>(6, 9).clone();
-        let dp_dbg = self.preint.jacobian.fixed_view::<3,3>(6, 12).clone();
+        let dv_dba = self.preint.jacobian.fixed_view::<3,3>(idx_v, idx_ba).clone();
+        let dv_dbg = self.preint.jacobian.fixed_view::<3,3>(idx_v, idx_bg).clone();
+        let dp_dba = self.preint.jacobian.fixed_view::<3,3>(idx_p, idx_ba).clone();
+        let dp_dbg = self.preint.jacobian.fixed_view::<3,3>(idx_p, idx_bg).clone();
 
-        // // Residual w.r.t. velocity and position
         let dv_corr = self.preint.dv + dv_dbg * db_g.clone() + dv_dba.clone() * db_a.clone();
+
         let dp_corr = self.preint.dp + dp_dbg * db_g + dp_dba.clone() * db_a.clone();
 
         // Residual w.r.t. rotation
@@ -750,49 +752,31 @@ impl Factor for ImuFactor {
 
         // let R_i_inv: Matrix3<f64> = R_i.inverse(None).rotation_matrix().into();
         let RiT = R_i.inverse(None).rotation_matrix();
-        let v_diff = g_w.clone() * self.preint.dt + v_j.clone() - v_i.clone();
         
-        let residual_dv = RiT * v_diff - dv_corr;
-        let residual_dp = RiT * (T_B_W_j.inverse(None).translation() - T_B_W_i.inverse(None).translation() - v_i.clone() * self.preint.dt 
-            + 0.5 * g_w.clone() * self.preint.dt * self.preint.dt) - dp_corr;
+        let residual_dv = RiT * a_v - dv_corr;
+        let residual_dp = RiT * a_p - dp_corr;
+        // let residual_dv = a_v - dv_corr;
+        // let residual_dp = a_p - dp_corr;
         let residual_bg = bg_j.clone() - bg_i.clone();
         let residual_ba = ba_j.clone() - ba_i.clone();
 
-        // let residual_b: na::SVector<f64, 6> = {
-        //     let mut v = na::SVector::<f64, 6>::zeros();
-        //     v.rows_mut(0, 3).copy_from(&(ba_j - ba_i));
-        //     v.rows_mut(3, 3).copy_from(&(bg_j - bg_i));
-        //     v
-        // };
+        let grav_term = g_w * self.preint.dt;
+        let v_diff = v_j.clone() - v_i.clone();
+        print!("Velocity residual parts: RiT * a_v = {:?}\n a_v = {:?}\n dv_corr = {:?}\n v_diff = {:?}\n grav_term = {:?}\n preint.dv = {:?}\n", RiT * a_v, a_v, dv_corr, v_diff, grav_term, self.preint.dv);
+
+        print!("Norm of residuals: r_dR = {}, r_dv = {}, r_dp = {}, r_ba = {}, r_bg = {}\n", residual_dR.coeffs().norm(), residual_dv.norm(), residual_dp.norm(), residual_ba.norm(), residual_bg.norm());
+    
         // Convert SO3Tangent to DVector
         let residual_dR_vec: DVector<f64> = residual_dR.clone().into();
-
-        // log::info!("r_dR norm {}", residual_dR_vec.norm());
-        // log::info!("r_dv norm {}", residual_dv.norm());
-        // log::info!("r_dp norm {}", residual_dp.norm());
-        // log::info!("r_ba norm {}", residual_ba.norm());
-        // log::info!("r_bg norm {}", residual_bg.norm());
         
         // Concatenate all residuals into a single fixed-size Vector15
         let mut residuals_fixed = na::SVector::<f64, 15>::zeros();
-        residuals_fixed.rows_mut(0, 3).copy_from(&residual_dR_vec);
-        residuals_fixed.rows_mut(3, 3).copy_from(&residual_dv);
-        residuals_fixed.rows_mut(6, 3).copy_from(&residual_dp);
-        residuals_fixed.rows_mut(9, 3).copy_from(&residual_ba);
-        residuals_fixed.rows_mut(12, 3).copy_from(&residual_bg);
+        residuals_fixed.rows_mut(idx_r, 3).copy_from(&residual_dR_vec);
+        residuals_fixed.rows_mut(idx_v, 3).copy_from(&residual_dv);
+        residuals_fixed.rows_mut(idx_p, 3).copy_from(&residual_dp);
+        residuals_fixed.rows_mut(idx_ba, 3).copy_from(&residual_ba);
+        residuals_fixed.rows_mut(idx_bg, 3).copy_from(&residual_bg);
         let residuals_whitened = self.preint.whiten_residual_15(&(residuals_fixed));
-
-        // let mut residuals_bias = na::SVector::<f64, 6>::zeros();
-        // residuals_bias.rows_mut(0, 3).copy_from(&residual_ba);
-        // residuals_bias.rows_mut(3, 3).copy_from(&residual_bg);
-        // let sigma  = self.preint.
-        // let residuals_bias_whitened = self.preint.whiten_bias_residual(&residuals_b);
-        // let residuals_bias_whitened = self.preint.sqrt_info_bias * residual_b;
-
-        // let mut residuals_whitened_combined: na::SVector<f64, 15> = na::SVector::<f64, 15>::zeros();
-        // residuals_whitened_combined.rows_mut(0, 9).copy_from(&residuals_whitened);
-        // // residuals_whitened_combined.rows_mut(0, 9).copy_from(&residuals_fixed);
-        // residuals_whitened_combined.rows_mut(9, 6).copy_from(&residuals_bias_whitened);
 
         let residuals = DVector::from_vec(residuals_whitened.as_slice().to_vec());
 
@@ -801,7 +785,7 @@ impl Factor for ImuFactor {
 
         // print!("Bias diffs dv_dba = {:?}, dp_dba = {:?}, db_a = {:?}\n", dv_dba.clone_owned(), dp_dba.clone_owned(), db_a);
         // print!("Velocity diff and gravity term: v_diff = {:?}, gravity_vel = {:?}, dt = {:?}, dv = {:?}\n", v_diff, grav_vel, self.preint.dt, self.preint.dv);
-        print!("Residuals IMU factor: r_dR = {:?}, r_dv = {:?}, r_dp = {:?}, r_ba = {:?}, r_bg = {:?}\n", residual_dR_vec, residual_dv, residual_dp, residual_ba, residual_bg);
+        // print!("Residuals IMU factor: r_dR = {:?}, r_dv = {:?}, r_dp = {:?}, r_ba = {:?}, r_bg = {:?}\n", residual_dR_vec, residual_dv, residual_dp, residual_ba, residual_bg);
 
         // log::debug!("[Optimization]: dt {:?}", dt);
 
@@ -825,43 +809,45 @@ impl Factor for ImuFactor {
             let d_rR_d_phi_j = Jr_inv;
 
             // Fill blocks
-            J.fixed_view_mut::<3,3>(0, 0).copy_from(&d_rR_d_phi_i); // phi_i
-            J.fixed_view_mut::<3,3>(0, 15).copy_from(&d_rR_d_phi_j); // phi_j
+            J.fixed_view_mut::<3,3>(idx_r, 0).copy_from(&d_rR_d_phi_i); // phi_i
+            J.fixed_view_mut::<3,3>(idx_r, 15).copy_from(&d_rR_d_phi_j); // phi_j
 
             // Gyro bias block
             let J_br = right_jacobian_so3(&phi_b);
             let d_rR_d_bg = -Jr_inv * residual_dR.exp(None).rotation_matrix().transpose() * J_br * dR_dbg;
             // print!("Jr_inv: {:?}, residual_dR: {:?}, J_br: {:?}, dR_dbg: {:?}, d_rR_d_bg: {:?}", Jr_inv, residual_dR.coeffs(), J_br, dR_dbg, d_rR_d_bg);
-            J.fixed_view_mut::<3,3>(0, 12).copy_from(&(d_rR_d_bg));
+            J.fixed_view_mut::<3,3>(idx_r, idx_bg).copy_from(&(d_rR_d_bg));
 
             // === Velocity rows [3..6) ===
-            let a_v = v_j.clone() - v_i.clone() + g_w.clone() * dt;
+            // let a_v = v_j.clone() - v_i.clone() + g_w.clone() * dt;
             let d_rv_d_phi_i = skew_symmetric(&(RiT * a_v)); // (Ri^T a_v)^wedge  [file:1]
-            J.fixed_view_mut::<3,3>(3, 0).copy_from(&d_rv_d_phi_i);  // phi_i
-            J.fixed_view_mut::<3,3>(3, 3).copy_from(&(-RiT));       // v_i
-            J.fixed_view_mut::<3,3>(3, 18).copy_from(&RiT);         // v_j
-            J.fixed_view_mut::<3,3>(3, 9).copy_from(&(-dv_dba));   // ba_i
-            J.fixed_view_mut::<3,3>(3, 12).copy_from(&(-dv_dbg));   // bg_i
+            J.fixed_view_mut::<3,3>(idx_v, idx_r).copy_from(&d_rv_d_phi_i); // phi_i
+            // J.fixed_view_mut::<3,3>(idx_v, idx_v).copy_from(&(-RiT));       // v_i
+            // J.fixed_view_mut::<3,3>(idx_v, idx_v + 15).copy_from(&RiT);     // v_j
+            J.fixed_view_mut::<3,3>(idx_v, idx_v).copy_from(&(-RiT));       // v_i
+            J.fixed_view_mut::<3,3>(idx_v, idx_v + 15).copy_from(&RiT);     // v_j
+            J.fixed_view_mut::<3,3>(idx_v, idx_ba).copy_from(&(-dv_dba));   // ba_i
+            J.fixed_view_mut::<3,3>(idx_v, idx_bg).copy_from(&(-dv_dbg));   // bg_i
 
             // === Translation rows [6..9) ===
-            let a_p = t_j - t_i - v_i.clone() * dt + 0.5 * g_w.clone() * dt * dt;
+            // let a_p = t_j - t_i - v_i.clone() * dt + 0.5 * g_w.clone() * dt * dt;
             let d_rp_d_phi_i = skew_symmetric(&(RiT * a_p)); // (Ri^T a_p)^wedge  [file:1]
-            J.fixed_view_mut::<3,3>(6, 0).copy_from(&d_rp_d_phi_i);          // phi_i
-            J.fixed_view_mut::<3,3>(6, 3).copy_from(&(-RiT * dt));          // v_i
-            J.fixed_view_mut::<3,3>(6, 6).copy_from(&(-na::Matrix3::identity()));  // p_i
-            // J.fixed_view_mut::<3,3>(6, 6).copy_from(&(-RiT));
-            // J.fixed_view_mut::<3,3>(6, 21).copy_from(&(RiT));          // p_j
-            J.fixed_view_mut::<3,3>(6, 21).copy_from(&(RiT * R_j.rotation_matrix()));          // p_j
-            J.fixed_view_mut::<3,3>(6, 9).copy_from(&(-dp_dba));           // ba_i
-            J.fixed_view_mut::<3,3>(6, 12).copy_from(&(-dp_dbg));           // bg_i
+            J.fixed_view_mut::<3,3>(idx_p, idx_r).copy_from(&d_rp_d_phi_i);          // phi_i
+            J.fixed_view_mut::<3,3>(idx_p, idx_v).copy_from(&(-RiT * dt));          // v_i
+            J.fixed_view_mut::<3,3>(idx_p, idx_p).copy_from(&(-na::Matrix3::identity()));  // p_i
+            // J.fixed_view_mut::<3,3>(idx_p, idx_p).copy_from(&(-RiT));
+            // J.fixed_view_mut::<3,3>(idx_p, idx_p + 15).copy_from(&(RiT));          // p_j
+            J.fixed_view_mut::<3,3>(idx_p, idx_p + 15).copy_from(&(RiT * R_j.rotation_matrix()));          // p_j
+            J.fixed_view_mut::<3,3>(idx_p, idx_ba).copy_from(&(-dp_dba));           // ba_i
+            J.fixed_view_mut::<3,3>(idx_p, idx_bg).copy_from(&(-dp_dbg));           // bg_i
             // === Bias rows [9..15) ===
-            J.fixed_view_mut::<3,3>(9, 9).copy_from(&(-na::Matrix3::identity()));   // ba_i
-            J.fixed_view_mut::<3,3>(9, 24).copy_from(&na::Matrix3::identity());    // ba_j
-            J.fixed_view_mut::<3,3>(12, 12).copy_from(&(-na::Matrix3::identity()));  // bg_i
-            J.fixed_view_mut::<3,3>(12, 27).copy_from(&na::Matrix3::identity());   // bg_j
+            J.fixed_view_mut::<3,3>(idx_ba, idx_ba).copy_from(&(-na::Matrix3::identity()));   // ba_i
+            J.fixed_view_mut::<3,3>(idx_ba, idx_ba + 15).copy_from(&na::Matrix3::identity());    // ba_j
+            J.fixed_view_mut::<3,3>(idx_bg, idx_bg).copy_from(&(-na::Matrix3::identity()));  // bg_i
+            J.fixed_view_mut::<3,3>(idx_bg, idx_bg + 15).copy_from(&na::Matrix3::identity());   // bg_j
 
-            print!("Jacobian velocity blocks: dv_dphi = {:?}, dv_dv_i = {:?}, dv_dv_j = {:?}, dv_dba_i = {:?}, dv_dbg_i = {:?}\n", 
-                J.fixed_view::<3,3>(3, 0).clone_owned(), J.fixed_view::<3,3>(3, 3).clone_owned(), J.fixed_view::<3,3>(3, 18).clone_owned(), J.fixed_view::<3,3>(3, 9).clone_owned(), J.fixed_view::<3,3>(3, 12).clone_owned());
+            // print!("Jacobian velocity blocks: dv_dphi = {:?}, dv_dv_i = {:?}, dv_dv_j = {:?}, dv_dba_i = {:?}, dv_dbg_i = {:?}\n", 
+            //     J.fixed_view::<3,3>(3, 0).clone_owned(), J.fixed_view::<3,3>(3, 3).clone_owned(), J.fixed_view::<3,3>(3, 18).clone_owned(), J.fixed_view::<3,3>(3, 9).clone_owned(), J.fixed_view::<3,3>(3, 12).clone_owned());
 
             Some(J)
         } else {

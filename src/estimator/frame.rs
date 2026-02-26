@@ -1,6 +1,7 @@
 use crate::datasets::ImuData;
 use crate::estimator::state::State;
 use crate::feature_tracker::Feature;
+use crate::imu;
 use crate::imu::piecewise_integration::PreInt;
 use crate::types::{Matrix4x4, Vector3};
 use nalgebra as na;
@@ -104,6 +105,16 @@ impl Frame {
             right_features: Vec::new(),
             imu_preintegration: None,
         }
+    }
+
+    pub fn add_imu_data(&mut self, imu_data: ImuData) {
+        let un_gyr = 0.5 * (imu_data.gyro + self.state.gyro_bias);
+        // self.state.T_W_B = 
+
+
+        self.imu_from_last_frame.push(imu_data.clone());
+        self.imu_since_last_keyframe.push(imu_data);
+        
     }
 
     /// Immutable access to left-image features.

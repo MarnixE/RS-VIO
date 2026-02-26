@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::{datasets::{ImuData, config}, imu, types::Vector3};
-use faer::traits::math_utils::sqrt;
+use faer::{row, traits::math_utils::sqrt};
 use imageproc::noise;
 use nalgebra::{self as na, Cholesky, SymmetricEigen};
 use apex_solver::manifold::{LieGroup, so3::SO3};
@@ -191,7 +191,9 @@ impl ImuPiecewiseIntegration {
             let omega_unbiased = imu.gyro - bias_g;
 
             let dphi = omega_unbiased  * dt; // Angular increment
-            let dR_kkp1 = SO3::from_scaled_axis(dphi);
+            let axis = na::Unit::new_normalize(dphi);
+            let angle = dphi.norm();
+            let dR_kkp1 = SO3::from_quaternion(na::UnitQuaternion::from_axis_angle(&axis, angle));
             let J_r = self.right_jacobian_so3(&dphi);
 
             let dv_ikm1 = dv_ik.clone(); // Cache delta_v_i_k before updating it for the next iteration
@@ -199,11 +201,12 @@ impl ImuPiecewiseIntegration {
             dp_ik += dv_ikm1 * dt + dR_ik.rotation_matrix() * acc_unbiased * dt * dt * 0.5;
 
             let A = self.construct_A(&dR_kkp1, &dR_ik, &acc_unbiased, dt);
-            let B = self.construct_B(&J_r, &dR_ik, dt);
+            let B = self.construct_B(&J_r, &dR_ik, dt, &acc_unbiased);
             
             let noise = self.compute_noise(dt);
 
             cov_ik = A * cov_ik * A.transpose() + B * noise * B.transpose(); // Propagate covariance
+            
 
             dR_ik = SO3::from_quaternion(dR_ik.quaternion() * dR_kkp1.quaternion());
 
@@ -309,13 +312,14 @@ impl ImuPiecewiseIntegration {
         // A
     }
 
-    fn construct_B(&self, Jr: &na::Matrix3<f64>, dR_ik: &SO3, dt: f64) -> na::SMatrix<f64, 15, 12> {
+    fn construct_B(&self, Jr: &na::Matrix3<f64>, dR_ik: &SO3, dt: f64, acc_unbiased: &na::Vector3<f64>) -> na::SMatrix<f64, 15, 12> {
         let I3 = na::Matrix3::<f64>::identity();
         let R_ik = dR_ik.rotation_matrix();
 
-        let B_phig = Jr * dt;
+        let B_phig = I3 * dt; // Instead of Jr
         let B_va   = R_ik * dt;
         let B_pa   = 0.5 * R_ik * (dt * dt);
+        let B_pg = -0.5 * R_ik * skew_symmetric(acc_unbiased) * dt * dt; // Gyro noise also affects position through rotation error
 
         let B_ba = I3 * dt;                   // b_a <- accel-bias RW noise
         let B_bg = I3 * dt;                   // b_g <- gyro-bias  RW noise
@@ -323,7 +327,7 @@ impl ImuPiecewiseIntegration {
         na::stack![
             0, B_phig, 0, 0;
             B_va, 0, 0, 0;
-            B_pa, 0, 0, 0;
+            B_pa, B_pg, 0, 0;
             0, 0, B_ba, 0;
             0, 0, 0, B_bg
         ]
@@ -332,10 +336,10 @@ impl ImuPiecewiseIntegration {
     fn compute_noise(&self, dt: f64) -> na::SMatrix<f64, 12, 12> {
         let I3 = na::Matrix3::<f64>::identity();
 
-        let gyr_n = self.gyro_noise_density / sqrt(&dt);   // GYR_N in VINS config meaning
-        let acc_n = self.accel_noise_density / sqrt(&dt);  // ACC_N
-        let acc_w = self.accel_random_walk / sqrt(&dt);        // ACC_W
-        let gyr_w = self.gyro_random_walk / sqrt(&dt);         // GYR_W
+        let gyr_n = self.gyro_noise_density / sqrt(&dt); // rad / s
+        let acc_n = self.accel_noise_density / sqrt(&dt);  // m / s^2
+        let acc_w = self.accel_random_walk / sqrt(&dt); // m / s^3
+        let gyr_w = self.gyro_random_walk / sqrt(&dt); // rad / s^2    
 
         let Qa = (acc_n * acc_n) * I3;  // n_a
         let Qg = (gyr_n * gyr_n) * I3;   // n_omega
@@ -351,19 +355,38 @@ impl ImuPiecewiseIntegration {
         ]
     }
 
+    // pub fn compute_sqrt_info(&self, sigma: &Matrix15) -> Matrix15 {
+    //     // let info = sigma.try_inverse().expect("Failed to invert bias covariance for sqrt info");
+    //     let chol_info = na::Cholesky::new(sigma.clone());
+    //     let lw = chol_info.as_ref().unwrap().l();
+
+    //     let sqrt_info = lw.transpose();
+    //     let diff = sqrt_info.transpose() * sqrt_info - sigma;
+    //     let max_diff = diff.iter().fold(0.0, |max, &val| val.abs().max(max));
+
+    //     let err_f = diff.norm();
+    //     let info_f = sigma.norm();
+    //     assert!(err_f / info_f < 1e-10);
+    //     // print!("Sqrt info:\n{:?}", sqrt_info);
+    //     let cov = sqrt_info.try_inverse().expect("Failed to invert sqrt_info");
+    //     // print!("cov:\n{:?}", cov);
+    //     sqrt_info
+    // }
+
     pub fn compute_sqrt_info(&self, sigma: &Matrix15) -> Matrix15 {
-        let info = sigma.try_inverse().expect("Failed to invert bias covariance for sqrt info");
-        let chol_info = na::Cholesky::new(info);
-        let lw = chol_info.as_ref().unwrap().l();
+        // Σ = L Lᵀ
+        // for (i, row) in sigma.row_iter().enumerate() {
+        //     print!("Sigma: Row {}: {:?}\n", i, row.clone_owned());
+        // } 
+        let chol = na::Cholesky::new(*sigma).expect("Matrix is not SPD"); // None if not SPD [page:1]
+        let l: Matrix15 = chol.l();            // lower-triangular factor L [page:1]
 
-        let sqrt_info = lw.transpose();
-        let diff = sqrt_info.transpose() * sqrt_info - info;
-        let max_diff = diff.iter().fold(0.0, |max, &val| val.abs().max(max));
-
-        let err_f = diff.norm();
-        let info_f = info.norm();
-        assert!(err_f / info_f < 1e-10);
-
+        // Solve Lᵀ X = I  =>  X = L^{-T} = Σ^{-1/2}
+        let i = Matrix15::identity();
+        let sqrt_info = l.tr_solve_lower_triangular(&i).expect("Failed to solve"); // Option<Matrix15> [page:0]
+        // for (i, row) in sqrt_info.row_iter().enumerate() {
+        //     print!("Sqrt_info: Row {}: {:?}\n", i, row.clone_owned());
+        // } 
         sqrt_info
     }
 

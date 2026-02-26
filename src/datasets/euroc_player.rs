@@ -341,10 +341,7 @@ impl EurocPlayer {
             // Parse timestamp first for early filtering
             let timestamp_str = parts[0].trim();
             if let Ok(timestamp) = timestamp_str.parse::<i64>() {
-                // Apply temporal filter: [start_timestamp, end_timestamp]
-                if timestamp < start_timestamp {
-                    continue;  // Skip measurements before window
-                }
+                // Apply temporal filter: include all measurements up to end_timestamp
                 if timestamp > end_timestamp {
                     break;  // EuRoC CSV is sorted; no more relevant data
                 }
@@ -416,7 +413,11 @@ impl EurocPlayer {
                 image_data[context.current_idx].timestamp,
             ))
         } else {
-            None
+            Some(Self::get_imu_data_between_frames(
+                imu_data,
+                0,
+                image_data[context.current_idx].timestamp,
+            ))
         };
         
         // Process frame

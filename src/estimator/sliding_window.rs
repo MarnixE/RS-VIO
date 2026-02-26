@@ -68,7 +68,7 @@ impl SlidingWindow {
     /// 
     /// # Returns
     /// `true` if the frame was added, `false` if it was rejected (e.g., not a keyframe)
-    pub fn add_frame(&mut self, frame: Frame) -> bool {
+    pub fn add_frame(&mut self, frame: Frame)  -> bool {
         // Only accept keyframes
         if !frame.is_keyframe {
             log::warn!(
@@ -107,6 +107,10 @@ impl SlidingWindow {
                 imu_preintegration.gravity = gravity;
             }
         }
+    }
+
+    pub fn set_initial_rotation(&mut self, init_rotation: na::Matrix3<f64>) {
+        self.keyframes[0].state.T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&init_rotation);
     }
 
     /// Get the current number of keyframes in the window.
@@ -746,10 +750,6 @@ impl SlidingWindow {
         let mut a = na::DMatrix::<f64>::zeros(n_states, n_states);
         let mut b = na::DVector::<f64>::zeros(n_states);
 
-        // let T_B_W = self.keyframes[0].state.T_W_B.try_inverse().expect("T_W_B should be invertible");
-        // let t_B_W = T_B_W.fixed_view::<3, 1>(0, 3);
-        // let R_B_W = Matrix3x3::from(T_B_W.fixed_view::<3, 3>(0, 0));
-
         for (i, (frame_i, frame_j)) in self.keyframes.iter().zip(self.keyframes.iter().skip(1)).enumerate() {
             let mut tmp_a = na::DMatrix::<f64>::zeros(6, 10);
             let mut tmp_b = na::DVector::<f64>::zeros(6);
@@ -803,7 +803,7 @@ impl SlidingWindow {
         let g = solution.fixed_rows::<3>(n_states - 4).into_owned();
         log::debug!("[Linear Alignment] Result g: {:?}, {:?}", g.norm(), g.transpose());
         let g_prior = na::Vector3::<f64>::new(0.0, 0.0, -9.81);
-        if (g.norm() - g_prior.norm()).abs() > 0.1 || s < 0.0 {
+        if (g.norm() - g_prior.norm()).abs() > 0.5 || s < 0.7 || s > 1.3 {
             log::warn!("[Linear Alignment] Linear alignment result is invalid. g.norm(): {:.6}, g_prior.norm(): {:.6}, scale factor: {:.6}", g.norm(), g_prior.norm(), s);
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "Linear alignment result is invalid. Need more motion"));
         }

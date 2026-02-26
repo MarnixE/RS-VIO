@@ -856,19 +856,16 @@ mod tests {
         let dR = so3::SO3::identity(); // must match your implementation
 
         let preint = PreInt::new(
-            dt,
             dR,
             Vector3::zeros(),
+            Vector3::zeros(),
             na::SMatrix::<f64, 15, 15>::identity(),
             dt,
-            // Jr_bg: Matrix3::zeros(),
-            // Jv_bg: Matrix3::zeros(),
-            // Jv_ba: Matrix3::zeros(),
             Vector3::zeros(),
             Vector3::zeros(),
             na::SMatrix::<f64, 15, 15>::identity(),
-            na::SMatrix::<f64, 6, 6>::identity(),
-            Vec::new(),
+            na::SMatrix::<f64, 15, 15>::identity(),
+            &Vec::new(),
             g,
         );
 
@@ -902,19 +899,18 @@ mod tests {
             dR: so3::SO3::identity(),
             dv: Vector3::new(1.0, 2.0, 3.0),
             dp: Vector3::new(4.0, 5.0, 6.0),
-            Jr_bg: Matrix3::zeros(),
-            Jv_bg: Matrix3::zeros(),
-            Jv_ba: Matrix3::zeros(),
             linearized_ba: Vector3::zeros(),
             linearized_bg: Vector3::zeros(),
             sqrt_info: na::SMatrix::<f64, 15, 15>::identity() * 2.0, // no whitening
-            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity() * 3.0,
             cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
-            // gyro_random_walk: Vector3::from_element(0.00),
-            // accel_random_walk: Vector3::from_element(0.00), // no whitening
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
             jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
         };
 
         let bias_a = Vector3::zeros();
@@ -937,7 +933,6 @@ mod tests {
         // Now compute the same residual with whitening disabled (w9=1,w6=1) and compare scaling.
         let mut preint_un = preint.clone();
         preint_un.sqrt_info = na::SMatrix::<f64, 15, 15>::identity();
-        preint_un.sqrt_info_bias = na::SMatrix::<f64, 6, 6>::identity();
         let factor_un = ImuFactor::new(preint_un, bias_a, bias_g);
         let (r_un, j_un) = factor_un.linearize(&params, true);
         let j_un = j_un.unwrap();
@@ -974,19 +969,18 @@ mod tests {
             dR: so3::SO3::identity(),
             dv: Vector3::new(0.1, -0.2, 0.05),
             dp: Vector3::new(0.01, 0.02, -0.03),
-            Jr_bg: 0.01 * Matrix3::identity(),
-            Jv_bg: 0.02 * Matrix3::identity(),
-            Jv_ba: 0.03 * Matrix3::identity(),
             linearized_bg: 0.04 * Vector3::zeros(),
             linearized_ba: 0.05 * Vector3::zeros(),
             sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
-            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
             cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
-            // gyro_random_walk: Vector3::from_element(0.00),
-            // accel_random_walk: Vector3::from_element(0.00), // no whitening
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
             jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
         };
 
         let bias_a = Vector3::new(0.021, -0.011, -0.031);
@@ -1058,17 +1052,18 @@ mod tests {
             dR: so3::SO3::identity(),
             dv: Vector3::zeros(),
             dp: Vector3::zeros(),
-            Jr_bg: Matrix3::zeros(),
-            Jv_bg: Matrix3::zeros(),
-            Jv_ba: Matrix3::zeros(),
             linearized_ba: Vector3::zeros(),
             linearized_bg: Vector3::zeros(),
             jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
             sqrt_info: na::SMatrix::<f64, 15, 15>::identity(), // no whitening
-            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
             cov: na::SMatrix::<f64, 15, 15>::identity(), // not used
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
         };
         let factor = ImuFactor::new(preint, Vector3::zeros(), Vector3::zeros());
 
@@ -1364,21 +1359,23 @@ mod tests {
         delta_p: Vector3<f64>,
     ) -> PreInt {
         let quat = UnitQuaternion::from_rotation_matrix(&na::Rotation3::from_matrix_unchecked(delta_r_mat));
-        PreInt { dR: so3::SO3::new(quat), 
-            dv: delta_v, dp: delta_p, 
-            cov: na::SMatrix::<f64, 15, 15>::identity(), dt, 
-            Jr_bg: na::SMatrix::<f64, 3, 3>::zeros(), 
-            Jv_bg: na::SMatrix::<f64, 3, 3>::zeros(), 
-            Jv_ba: na::SMatrix::<f64, 3, 3>::zeros(), 
+        PreInt { 
+            dR: so3::SO3::new(quat), 
+            dv: delta_v, 
+            dp: delta_p, 
+            cov: na::SMatrix::<f64, 15, 15>::identity(), 
+            dt, 
             linearized_bg: na::Vector3::<f64>::zeros(), 
             linearized_ba: na::Vector3::<f64>::zeros(), 
-            // gyro_random_walk: na::Vector3::<f64>::from_element(1.0), 
-            // accel_random_walk: na::Vector3::<f64>::from_element(1.0), 
             sqrt_info: na::SMatrix::<f64, 15, 15>::identity(),
-            sqrt_info_bias: na::SMatrix::<f64, 6, 6>::identity(),
             imu_buffer: Vec::new(), // not used
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
             jacobian: na::SMatrix::<f64, 15, 15>::identity(), // not used
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
         }
     }
 

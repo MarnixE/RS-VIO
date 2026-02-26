@@ -51,6 +51,7 @@ pub struct Estimator<'a> {
 
     imu_buffer: Vec<ImuData>, // Buffer to store incoming IMU data for preintegration
     first_frame: bool, // Flag to indicate if the current frame is the first frame (used for initialization)
+    first_imu: bool,
 }
 
 impl<'a> Estimator<'a> {
@@ -118,6 +119,7 @@ impl<'a> Estimator<'a> {
             accel_biases: Vec::new(),
             imu_buffer: Vec::new(),
             first_frame: true,
+            first_imu: true,
         }
     }
 
@@ -278,6 +280,16 @@ impl<'a> Estimator<'a> {
         // Bundle adjustment
         if current_frame.is_keyframe {
             let imu_start = Instant::now();
+
+            let init_rotation = if self.first_imu {
+                Some(self.process_first_imu(&imu_data.unwrap()))
+            } else {
+                None
+            };
+            if init_rotation.is_some() {
+                self.imu_buffer.clear();
+            }
+
             log::error!("IMU buffer size before preintegration: {}", self.imu_buffer.len());
             let imu_preint = self.piecewise_integration.propagate(
                 &self.imu_buffer,
@@ -285,16 +297,21 @@ impl<'a> Estimator<'a> {
                 &self.gyro_biases.last().unwrap_or(&Vector3::from_element(1e-4)),
             );
             self.imu_buffer.clear(); // Clear the buffer after preintegration
+            if let Some(imu_data) = imu_data {
+                self.imu_buffer.extend_from_slice(imu_data);
+            }
             
-            // if !self.first_frame {
-            //     self.first_frame = false;
-            // } else {
             current_frame.add_imu_preint(imu_preint);
             // }
             imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
 
             let optimization_start = Instant::now();
             self.sliding_window.add_frame(current_frame);
+            if init_rotation.is_some() {
+                self.sliding_window.set_initial_rotation(init_rotation.unwrap());
+            } else {
+                
+            }
             self.sliding_window.optimize(); // TODO handle error
             optimization_time_ms = optimization_start.elapsed().as_secs_f64() * 1000.0;
             self.view_optimization_results();
@@ -306,11 +323,14 @@ impl<'a> Estimator<'a> {
 
                 let (g_refined, scale) = if result.is_ok() {
                     self.sliding_window.initialized = true;
+                    // let (g_refined, scale) = result.unwrap();
+                    // panic!("Gravity and Scale are: {:?}, {}", g_refined, scale);
                     result.unwrap()
                 } else {
                     log::warn!("[Estimator] Linear alignment failed: {:?}. Using default gravity and scale.", result.err());
                     (na::Vector3::<f64>::new(0.0, 0.0, -9.81), 1.0)
                 };
+
                 self.piecewise_integration.gravity = g_refined;
                 
                 self.sliding_window.update_gravity(g_refined);
@@ -337,6 +357,37 @@ impl<'a> Estimator<'a> {
         if let Some(v) = &mut self.viewer {
             v.set_frame(frame_id);
         }
+    }
+
+    fn process_first_imu(&mut self, imu_data: &[ImuData]) -> na::Matrix3<f64> {
+        self.first_imu = false;
+
+        let mut avg_accel = Vector3::zeros();
+        let n = imu_data.len() as f64;
+        for data in imu_data {
+            avg_accel += Vector3::new(data.accel[0], data.accel[1], data.accel[2]);
+        }
+        avg_accel /= n;
+        log::info!("[Estimator] Average accel from first IMU batch: {:?}", avg_accel);
+
+        let init_rotation = self.gravity_to_rotation(&avg_accel);
+        init_rotation
+    }
+
+    fn gravity_to_rotation(&self, g: &Vector3) -> na::Matrix3<f64> {
+        let ng1 = g.normalize();
+        let ng2 = na::Vector3::new(0.0, 0.0, 1.0);
+
+        let R = na::UnitQuaternion::rotation_between(&ng1, &ng2).unwrap_or_else(|| {
+            // ng1 and ng2 are opposite; choose any axis perpendicular to ng1.
+            let helper = if ng1.x.abs() < 0.9 { na::Vector3::x() } else { na::Vector3::y() };
+            let axis = na::Unit::new_normalize(ng1.cross(&helper));
+            na::UnitQuaternion::from_axis_angle(&axis, std::f64::consts::PI)
+        });
+
+        let yaw = R.euler_angles().2;
+        let q0 = na::UnitQuaternion::from_euler_angles(0.0, 0.0, -yaw) * R;
+        q0.to_rotation_matrix().into_inner()
     }
 
     /// Visualize tracking results: stereo images with tracked features.
