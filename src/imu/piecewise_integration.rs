@@ -90,6 +90,27 @@ impl PreInt {
         }
     }
 
+    pub fn identity() -> Self {
+        Self {
+            dR: SO3::identity(),
+            dv: na::Vector3::zeros(),
+            dp: na::Vector3::zeros(),
+            cov: Matrix15::zeros(), // Small covariance to avoid singularity
+            dt: 0.0,
+            linearized_ba: na::Vector3::zeros(), 
+            linearized_bg: na::Vector3::zeros(), 
+            jacobian: na::SMatrix::<f64, 15, 15>::identity(),
+            sqrt_info: Matrix15::identity(), // Identity since covariance is near zero
+            imu_buffer: Vec::new(),
+            gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            idx_r: 0,
+            idx_v: 3,
+            idx_p: 6,
+            idx_ba: 9,
+            idx_bg: 12,
+        }
+    }
+
     pub fn finalize(&mut self) {
         // Symmetrize (numerical hygiene)
         let sigma = 0.5 * (self.cov + self.cov.transpose());
@@ -130,6 +151,7 @@ pub struct ImuPiecewiseIntegration {
     imu_buffer: Vec<ImuData>,
     // preintegrated_noise: na::SVector<f64, 9>,
     pub gravity: na::Vector3<f64>,
+    continious_noise: Matrix12,
 }
 
 #[allow(non_snake_case)]
@@ -146,6 +168,7 @@ impl ImuPiecewiseIntegration {
             gyro_random_walk: 1.0,
             imu_buffer: Vec::new(),
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            continious_noise: na::SMatrix::<f64, 12, 12>::zeros(), // Placeholder, should be set based on noise parameters
             // preintegrated_noise: na::SVector::<f64, 9>::zeros(),
         }
     }
@@ -160,77 +183,59 @@ impl ImuPiecewiseIntegration {
             gyro_random_walk: config.gyro_random_walk,
             imu_buffer: Vec::new(),
             gravity: na::Vector3::new(0.0, 0.0, -9.81),
+            continious_noise: na::SMatrix::<f64, 12, 12>::zeros(), // Placeholder, should be set based on noise parameters
             // preintegrated_noise: na::SVector::<f64, 9>::from_element(1.0),
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn propagate(&mut self, imu_slice: &[ImuData], current_frame: &mut Frame, new_bias_a: &Option<Vector3>, new_bias_g: &Option<Vector3>) {
+    pub fn process_imu(&mut self, imu_slice: &[ImuData], current_frame: &mut Frame) {
         if (imu_slice.is_empty()) {
             log::warn!("No IMU data to propagate");
             return;
         }
 
         self.imu_buffer = imu_slice.to_vec(); // Store the IMU data for repropagation
-        let mut prev_ts = imu_slice.first().map_or(0.0, |imu| imu.timestamp as f64 * 1e-9); // Initialize prev_timestamp to the timestamp of the first IMU measurement
-        let first_ts = prev_ts.clone();
-        let mut ts = 0.0;
-        
-        let mut dR_ik = SO3::identity(); // Initialize delta_R_j_i to identity
-        let mut dv_ik = na::Vector3::zeros(); // Initialize delta_v_j_i to zero
-        let mut dp_ik = na::Vector3::zeros(); // Initialize delta_p_j_i to zero
-
-        let mut jacobian = na::SMatrix::<f64, 15, 15>::identity();
-
-        let mut cov_ik = na::SMatrix::<f64, 15, 15>::zeros();
 
         let state = &current_frame.state;
-        
         let mut R_wb = state.T_W_B.fixed_view::<3, 3>(0, 0).clone_owned(); // Rotation world from body
         let mut t_wb = state.T_W_B.fixed_view::<3, 1>(0, 3).clone_owned(); // Translation world from body
         let mut v = state.velocity; // Initial velocity in world frame
-        let bias_a = new_bias_a.unwrap_or(state.accel_bias); // linearlized accel bias (assume constant during preintegration)
-        let bias_g = new_bias_g.unwrap_or(state.gyro_bias); // linearlized gyro bias (assume constant during preintegration)
 
-        let mut acc_0 = imu_slice.first().map_or(na::Vector3::zeros(), |imu| imu.accel);
-        let mut gyr_0 = imu_slice.first().map_or(na::Vector3::zeros(), |imu| imu.gyro);
+        let bias_a = state.accel_bias; // linearlized accel bias (assume constant during preintegration)
+        let bias_g = state.gyro_bias; // linearlized gyro bias (assume constant during preintegration)
 
+        let mut prev_ts = imu_slice.first().map_or(0.0, |imu| imu.timestamp as f64 * 1e-9);
+
+        // Initialize preintegration variables
+        let mut preint = PreInt::identity();
+        preint.linearized_ba = bias_a;
+        preint.linearized_bg = bias_g;
+
+        let mut acc_0 = imu_slice.first().map(|imu| imu.accel).unwrap();
+        let mut gyr_0 = imu_slice.first().map(|imu| imu.gyro).unwrap();
+
+        self.continious_noise = self.compute_noise();
+
+        // For simplicity, we can call propagate here, but in a real implementation we might want to batch process or handle this differently
         for (i, imu) in imu_slice.iter().enumerate().skip(1) {
-            ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
+            let ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
             let dt = ts - prev_ts;
+            preint.dt += dt; 
             if dt <= 0.0 {
+                log::warn!("Non-positive time interval between IMU measurements: dt = {}", dt);
                 continue;
             }
-            prev_ts = ts;
 
-            // let acc_unbiased = imu.accel - bias_a;
-            // let omega_unbiased = imu.gyro - bias_g;
-            let acc_unbiased = acc_0 - bias_a; // Bias-corrected acceleration
-            let omega_unbiased = gyr_0 - bias_g; // Bias-corrected
+            self.propagate(imu,
+                &mut preint,
+                dt,
+                &acc_0,
+                &gyr_0,
+                &bias_a, 
+                &bias_g
+            );
 
-            let dphi = omega_unbiased  * dt; // Angular increment
-            let axis = na::Unit::new_normalize(dphi);
-            let angle = dphi.norm();
-            let dR_kkp1 = SO3::from_quaternion(na::UnitQuaternion::from_axis_angle(&axis, angle));
-            let J_r = self.right_jacobian_so3(&dphi);
-
-            let dv_ikm1 = dv_ik.clone(); // Cache delta_v_i_k before updating it for the next iteration
-            dv_ik += dR_ik.rotation_matrix() * acc_unbiased * dt;
-            dp_ik += dv_ikm1 * dt + dR_ik.rotation_matrix() * acc_unbiased * dt * dt * 0.5;
-
-            let A = self.construct_A(&dR_kkp1, &dR_ik, &acc_unbiased, dt);
-            let B = self.construct_B(&J_r, &dR_ik, dt, &acc_unbiased);
-            
-            let noise = self.compute_noise(dt);
-
-            cov_ik = A * cov_ik * A.transpose() + B * noise * B.transpose(); // Propagate covariance
-
-            dR_ik = SO3::from_quaternion(dR_ik.quaternion() * dR_kkp1.quaternion());
-
-            jacobian = A * jacobian; // Update the Jacobian of the preintegrated measurement w.r.t. biases
-
-            // Update the state
-            let acc_w_un = R_wb * (acc_0 - bias_a);
             let acc_unbiased_world = R_wb * (acc_0 - bias_a) + self.gravity; // Transform acceleration to world frame for bias correction
             let omega_unbiased_world = gyr_0 - bias_g; // Angular velocity in world frame for bias correction
             R_wb *= SO3::from_scaled_axis(omega_unbiased_world * dt).rotation_matrix();
@@ -238,9 +243,13 @@ impl ImuPiecewiseIntegration {
             v += acc_unbiased_world * dt;
             acc_0 = imu.accel;
             gyr_0 = imu.gyro;
-            let a = 10;
-        }
 
+            acc_0 = imu.accel;
+            gyr_0 = imu.gyro;
+            prev_ts = ts;
+        }
+        
+        // Update the state
         let mut T_W_B = na::Matrix4::<f64>::identity();
         T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&R_wb);
         T_W_B.fixed_view_mut::<3, 1>(0, 3).copy_from(&t_wb);
@@ -251,54 +260,128 @@ impl ImuPiecewiseIntegration {
         // print!("Final T_W_B: {:?}", T_W_B);
         current_frame.state.T_W_B = T_W_B.try_into().expect("Failed to convert T_W_B to Matrix4x4");
         current_frame.state.velocity = v;
-
-        
-        let dt_step = ts - first_ts;
-
-        if dt_step <= 0.0 {
-            log::warn!("Invalid time interval for preintegration: dt_step = {}", dt_step);
-            // return PreInt::new(
-            //     SO3::identity(),
-            //     na::Vector3::zeros(),
-            //     na::Vector3::zeros(),
-            //     Matrix15::identity() * 1e-6, // Small covariance to avoid singularity
-            //     dt_step,
-            //     na::Vector3::zeros(),
-            //     na::Vector3::zeros(),
-            //     na::SMatrix::<f64, 15, 15>::identity(),
-            //     Matrix15::identity(), // Identity since covariance is near zero
-            //     imu_slice, // Store the raw IMU data for potential repropagation
-            //     self.gravity,
-            // )
-        }
-        
-        let preint = PreInt::new(
-            dR_ik,
-            dv_ik,
-            dp_ik,
-            cov_ik,
-            dt_step.clone(), // Total time from the first to the last IMU measurement
-            // bias_g,
-            // bias_a,
-            bias_a.clone(), 
-            bias_g.clone(), 
-            // gyro_random_walk: self.gyro_random_walk,
-            // accel_random_walk: self.accel_random_walk,
-            jacobian,
-            self.compute_sqrt_info(&cov_ik), // Compute square root information matrix
-            // sqrt_info_bias: na::Matrix6::identity(), // Identity for bias as well
-            imu_slice, // Store the raw IMU data for potential repropagation
-            self.gravity, // Default gravity
-        );
-
         current_frame.imu_preintegration = Some(preint);
     }
 
-    pub fn repropagate(&mut self, new_bias_a: &Vector3, new_bias_g: &Vector3, current_frame: &mut Frame) {
+    #[allow(non_snake_case)]
+    #[inline]
+    fn propagate(&mut self, imu: &ImuData, preint: &mut PreInt, dt: f64, acc_0: &Vector3, gyr_0: &Vector3, 
+            bias_a: &Vector3, bias_g: &Vector3) {
+        let acc_unbiased = acc_0 - bias_a; // Bias-corrected acceleration
+        let omega_unbiased = gyr_0 - bias_g; // Bias-corrected
+
+        let dphi = omega_unbiased  * dt; // Angular increment
+        let axis = na::Unit::new_normalize(dphi);
+        let angle = dphi.norm();
+        let dR_kkp1 = SO3::from_quaternion(na::UnitQuaternion::from_axis_angle(&axis, angle));
+        let J_r = self.right_jacobian_so3(&dphi);
+
+        // let dv_ikm1 = preint.dv; // Cache delta_v_i_k before updating it for the next iteration
+        preint.dp += preint.dv * dt + preint.dR.rotation_matrix() * acc_unbiased * dt * dt * 0.5;
+        preint.dv += preint.dR.rotation_matrix() * acc_unbiased * dt;
+
+        let A = self.construct_A(&dR_kkp1, &preint.dR, &acc_unbiased, dt);
+        let B = self.construct_B(&J_r, &preint.dR, dt, &acc_unbiased);
+        
+        let noise = self.continious_noise / dt; // Discretize noise
+        preint.cov = A * preint.cov * A.transpose() + B * noise * B.transpose(); // Propagate covariance
+
+        preint.dR = SO3::from_quaternion(preint.dR.quaternion() * dR_kkp1.quaternion());
+
+        preint.jacobian = A * preint.jacobian; // Update the Jacobian of the preintegrated measurement w.r.t. biases
+
+        // Update the state
+
+        // let a = 10;
+        // }
+
+        // let mut T_W_B = na::Matrix4::<f64>::identity();
+        // T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&R_wb);
+        // T_W_B.fixed_view_mut::<3, 1>(0, 3).copy_from(&t_wb);
+
+        // print!("Final T_W_B: \n{:?}\n", T_W_B);
+        // print!("Final velocity: \n{:?}\n", v);
+
+        // // print!("Final T_W_B: {:?}", T_W_B);
+        // current_frame.state.T_W_B = T_W_B.try_into().expect("Failed to convert T_W_B to Matrix4x4");
+        // current_frame.state.velocity = v;
+
+        
+        // let dt_step = ts - first_ts;
+
+        // if dt_step <= 0.0 {
+        //     log::warn!("Invalid time interval for preintegration: dt_step = {}", dt_step);
+        //     // return PreInt::new(
+        //     //     SO3::identity(),
+        //     //     na::Vector3::zeros(),
+        //     //     na::Vector3::zeros(),
+        //     //     Matrix15::identity() * 1e-6, // Small covariance to avoid singularity
+        //     //     dt_step,
+        //     //     na::Vector3::zeros(),
+        //     //     na::Vector3::zeros(),
+        //     //     na::SMatrix::<f64, 15, 15>::identity(),
+        //     //     Matrix15::identity(), // Identity since covariance is near zero
+        //     //     imu_slice, // Store the raw IMU data for potential repropagation
+        //     //     self.gravity,
+        //     // )
+        // }
+        
+        // let preint = PreInt::new(
+        //     dR_ik,
+        //     dv_ik,
+        //     dp_ik,
+        //     cov_ik,
+        //     dt_step.clone(), // Total time from the first to the last IMU measurement
+        //     // bias_g,
+        //     // bias_a,
+        //     bias_a.clone(), 
+        //     bias_g.clone(), 
+        //     // gyro_random_walk: self.gyro_random_walk,
+        //     // accel_random_walk: self.accel_random_walk,
+        //     jacobian,
+        //     self.compute_sqrt_info(&cov_ik), // Compute square root information matrix
+        //     // sqrt_info_bias: na::Matrix6::identity(), // Identity for bias as well
+        //     // imu_slice, // Store the raw IMU data for potential repropagation
+        //     self.gravity, // Default gravity
+        // );
+
+        // current_frame.imu_preintegration = Some(preint);
+    }
+
+    pub fn repropagate(&mut self, new_bias_a: &Vector3, new_bias_g: &Vector3) -> PreInt {
         let imu_slice = self.imu_buffer.clone(); // Get the original IMU data slice
+
+        let mut preint = PreInt::identity();
+
+        let mut acc_0 = imu_slice.first().map(|imu| imu.accel).unwrap();
+        let mut gyr_0 = imu_slice.first().map(|imu| imu.gyro).unwrap();
+        let mut prev_ts = imu_slice.first().map(|imu| imu.timestamp as f64 * 1e-9).unwrap();
         
         // Re-run the propagate function with the stored IMU data and new biases
-        self.propagate(&imu_slice, current_frame, &Some(new_bias_a.clone()), &Some(new_bias_g.clone()))
+        for (i, imu) in imu_slice.iter().enumerate().skip(1) {
+            let ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
+            let dt = ts - prev_ts;
+            preint.dt += dt; 
+            if dt <= 0.0 {
+                log::warn!("Non-positive time interval between IMU measurements: dt = {}", dt);
+                continue;
+            }
+
+            self.propagate(imu,
+                &mut preint,
+                dt,
+                &acc_0,
+                &gyr_0,
+                &new_bias_a, 
+                &new_bias_g
+            );
+
+            acc_0 = imu.accel;
+            gyr_0 = imu.gyro;
+            prev_ts = ts;
+        }
+        preint
+        // self.propagate(&imu_slice, preint, &Some(new_bias_a.clone()), &Some(new_bias_g.clone()))
     }
 
     fn right_jacobian_so3(&self, phi: &na::Vector3<f64>) -> na::Matrix3<f64> {
@@ -321,6 +404,7 @@ impl ImuPiecewiseIntegration {
         }
     }
 
+    #[inline]
     fn construct_A(&self, dR_kkp1: &SO3, dR_ik: &SO3, acc_unbiased: &na::Vector3<f64>, dt: f64) -> na::SMatrix<f64, 15, 15> {
         let I3 = na::Matrix3::<f64>::identity();
 
@@ -349,6 +433,7 @@ impl ImuPiecewiseIntegration {
         // A
     }
 
+    #[inline]
     fn construct_B(&self, Jr: &na::Matrix3<f64>, dR_ik: &SO3, dt: f64, acc_unbiased: &na::Vector3<f64>) -> na::SMatrix<f64, 15, 12> {
         let I3 = na::Matrix3::<f64>::identity();
         let R_ik = dR_ik.rotation_matrix();
@@ -370,13 +455,13 @@ impl ImuPiecewiseIntegration {
         ]
     }
 
-    fn compute_noise(&self, dt: f64) -> na::SMatrix<f64, 12, 12> {
+    fn compute_noise(&self) -> na::SMatrix<f64, 12, 12> {
         let I3 = na::Matrix3::<f64>::identity();
 
-        let gyr_n = self.gyro_noise_density / sqrt(&dt); // rad / s
-        let acc_n = self.accel_noise_density / sqrt(&dt);  // m / s^2
-        let acc_w = self.accel_random_walk / sqrt(&dt); // m / s^3
-        let gyr_w = self.gyro_random_walk / sqrt(&dt); // rad / s^2    
+        let gyr_n = self.gyro_noise_density; // rad / s
+        let acc_n = self.accel_noise_density;  // m / s^2
+        let acc_w = self.accel_random_walk; // m / s^3
+        let gyr_w = self.gyro_random_walk; // rad / s^2    
 
         let Qa = (acc_n * acc_n) * I3;  // n_a
         let Qg = (gyr_n * gyr_n) * I3;   // n_omega

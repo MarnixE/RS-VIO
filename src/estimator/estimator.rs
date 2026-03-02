@@ -215,6 +215,7 @@ impl<'a> Estimator<'a> {
             self.right_cam.clone(),
             self.T_B_Cl,
             self.T_B_Cr,
+            self.sliding_window.get_keyframe_poses().last().cloned(), // Use last keyframe pose as initial guess for current frame
             self.sliding_window.get_keyframe_velocities().and_then(|v| v.last().copied()),
             self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.last().copied()),
             self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.last().copied()),
@@ -298,11 +299,9 @@ impl<'a> Estimator<'a> {
                 current_frame.state.T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&init_rotation.unwrap());
                 
             }
-            self.piecewise_integration.propagate(
+            self.piecewise_integration.process_imu(
                 &self.imu_buffer,
                 &mut current_frame,
-                &None,
-            &None,
             );
 
             self.imu_buffer.clear(); // Clear the buffer after preintegration

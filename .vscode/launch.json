@@ -7,7 +7,7 @@
             "name": "Debug",
             "program": "${workspaceFolder}/target/debug/run_euroc",
             // "args": ["config/m2dgr.yaml", "/home/marnix/datasets/M2DGR/gate_01"],
-            "args": ["config/euroc_vio.yaml", "/home/marnix/datasets/EuRoC/machine_hall/MH_01_easy/MH_01_easy"],
+            "args": ["config/euroc_vio.yaml", "/home/marnix/datasets/EuRoC/MH01"],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "cargo build"
         }

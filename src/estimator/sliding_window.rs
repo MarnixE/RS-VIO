@@ -742,10 +742,10 @@ impl SlidingWindow {
 
         // Collect data before mutating self.keyframes
         for (id, frame) in self.keyframes.iter_mut().enumerate() {
-            imu_preintegrator.repropagate(
+            let preint = imu_preintegrator.repropagate(
                 &bga[id], 
-                &bgs[id], 
-                frame);
+                &bgs[id]);
+                frame.imu_preintegration = Some(preint);
         }
         bgs
     }

@@ -27,10 +27,10 @@ pub struct State {
 
 impl State {
 
-    pub fn new(T_B_Cl: Matrix4x4, T_B_Cr: Matrix4x4, 
+    pub fn new(T_B_Cl: Matrix4x4, T_B_Cr: Matrix4x4, T_B_W: Option<Matrix4x4>,
         velocity: Option<Vector3>, accel_bias: Option<Vector3>, gyro_bias: Option<Vector3>, angular_velocity: Option<Vector3>) -> Self {
         Self {
-            T_W_B: Matrix4x4::identity(),
+            T_W_B: T_B_W.unwrap_or(Matrix4x4::identity()),
             T_B_Cl: T_B_Cl,
             T_B_Cr: T_B_Cr,
             velocity: velocity.unwrap_or(Vector3::from_element(0.0)),
