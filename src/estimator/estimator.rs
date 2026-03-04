@@ -201,7 +201,8 @@ impl<'a> Estimator<'a> {
         remaped.save("remaped0.png").unwrap();
         */
         log::info!(
-            "[Estimator] Last velocity: {:?}, Last accel bias: {:?}, Last gyro bias: {:?}",
+            "[Estimator] Last pose {:?}, Last velocity: {:?}, Last accel bias: {:?}, Last gyro bias: {:?}",
+            self.sliding_window.get_keyframe_poses().last().cloned(),
             self.sliding_window.get_keyframe_velocities().and_then(|v| v.last().copied()),
             self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.last().copied()),
             self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.last().copied())
@@ -288,6 +289,7 @@ impl<'a> Estimator<'a> {
             let imu_start = Instant::now();
 
             let init_rotation = if self.first_imu && imu_data.is_some() {
+                print!("Imu data for preintegration: {:?}", imu_data.unwrap().len());
                 Some(self.process_first_imu(&imu_data.unwrap()))
             } else {
                 None
@@ -305,9 +307,6 @@ impl<'a> Estimator<'a> {
             );
 
             self.imu_buffer.clear(); // Clear the buffer after preintegration
-            if let Some(imu_data) = imu_data {
-                self.imu_buffer.extend_from_slice(imu_data);
-            }
             
             // current_frame.add_imu(imu_preint);
             imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
@@ -324,12 +323,10 @@ impl<'a> Estimator<'a> {
 
                 let (g_refined, scale) = if result.is_ok() {
                     self.sliding_window.initialized = true;
-                    let (g_refined, scale) = result.unwrap();
-                    panic!("Gravity and Scale are: {:?}, {}", g_refined, scale);
                     result.unwrap()
                 } else {
                     log::warn!("[Estimator] Linear alignment failed: {:?}. Using default gravity and scale.", result.err());
-                    (na::Vector3::<f64>::new(0.0, 0.0, -9.81), 1.0)
+                    (na::Vector3::<f64>::new(0.0, 0.0, 9.81007), 1.0)
                 };
 
                 self.piecewise_integration.gravity = g_refined;

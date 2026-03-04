@@ -17,6 +17,7 @@ use crate::optimization::factors::{BundleAdjustmentFactor, PnPFactor, ImuFactor}
 use crate::optimization::observer::TerminalObserver;
 use crate::estimator::Frame;
 use crate::types::{Matrix3x3, Matrix4x4, Vector3};
+use crate::feature_tracker::Feature;
 
 /// Sliding window of keyframes for bundle adjustment optimization.
 /// 
@@ -317,8 +318,13 @@ impl SlidingWindow {
                 (&frame.left_features, T_Cl_B),
                 (&frame.right_features, T_Cr_B),
             ];
+
+            let right_by_id: &HashMap<usize, &Feature> = &frame.right_features
+                .iter()
+                .map(|f| (f.feature_id, f))
+                .collect();
             
-            if id_frame > 0 && frame.imu_preintegration.is_some() && self.initialized && frame.imu_preintegration.clone().unwrap().dt < 10.0 {
+            if id_frame > 0 && frame.imu_preintegration.is_some() && self.initialized && frame.imu_preintegration.clone().unwrap().dt < 5.0 {
                 let imu_factor = ImuFactor::new(
                     frame.imu_preintegration.as_ref().unwrap().clone(),
                     frame.imu_preintegration.as_ref().unwrap().linearized_ba.clone(),
@@ -338,8 +344,20 @@ impl SlidingWindow {
             prev_kf_var = kf_var.clone();
             prev_vb_var = vb_var.clone();
 
-            
-            for (features, T_C_B) in camera_features.iter() {
+            // for left_feat in frame.left_features.iter() {
+            //     let Some(right_feat) = right_by_id.get(&left_feat.feature_id) else {
+            //         continue; // Skip if no corresponding right feature
+            //     };
+            //     if self.map_points.contains_key(&left_feat.feature_id) {
+            //         continue; // Skip if already in map points (will be added as factor later)
+            //     }
+
+            //     if let Some(p_w) =
+            // }
+
+            // TODO refactor the loop, quick and dirty check for left cam
+            for (i, (features, T_C_B)) in camera_features.iter().enumerate() {
+            // for left_observation in frame.left_features.iter() {
                 for feat in features.iter() {
                     let feature_id = feat.feature_id;
                     let lm_var = map_feature_to_landmark
@@ -362,18 +380,26 @@ impl SlidingWindow {
                                 ])
                             } else {
                                 // Default initialization if not in map_points
-                                // TODO Triangulate insrtead of assigning depth 4.0 (quick and dirty way to get going)
-                                let p_C = Vector3::new( feat.undistorted_coord[0] as f64, feat.undistorted_coord[1] as f64, 2.0 as f64);
+                                let right_feat = right_by_id.get(&feature_id).expect("Feature should be observed in both cameras");
+                                let p_B = self.triangulate_stereo(feat, &T_Cl_B, right_feat, &T_Cr_B).unwrap_or_else(|| {
+                                    // Fallback: project feature at default depth
+                                    let p_C = Vector3::new(feat.undistorted_coord[0] as f64, feat.undistorted_coord[1] as f64, 2.0);
+                                    let T_B_C = T_C_B.try_inverse().expect("T_C_B should be invertible");
+                                    let (R_B_C, t_B_C) = (
+                                        T_B_C.fixed_view::<3, 3>(0, 0).into_owned(),
+                                        T_B_C.fixed_view::<3, 1>(0, 3).into_owned(),
+                                    );
+                                    R_B_C * p_C + t_B_C
+                                });
                                 let (R_W_B, t_W_B) = (
-                                    frame.state.T_W_B.fixed_view::<3, 3>(0, 0).into_owned(),
-                                    frame.state.T_W_B.fixed_view::<3, 1>(0, 3).into_owned(),
-                                );
-                                let T_B_C = T_C_B.try_inverse().expect("T_C_B should be invertible");
-                                let (R_B_C, t_B_C) = (
-                                    T_B_C.fixed_view::<3, 3>(0, 0).into_owned(),
-                                    T_B_C.fixed_view::<3, 1>(0, 3).into_owned(),
-                                );
-                                let p_W = R_W_B * (R_B_C * p_C + t_B_C) + t_W_B;
+                                        frame.state.T_W_B.fixed_view::<3, 3>(0, 0).into_owned(),
+                                        frame.state.T_W_B.fixed_view::<3, 1>(0, 3).into_owned(),
+                                    );
+                                
+                                let p_W = R_W_B * p_B  + t_W_B;
+
+                                print!("Triangulated landmark {} at position {:?} from feature {} in frame {}, observed {} times in left cam and {} times in right cam", 
+                                    lm_var, p_W, feature_id, frame.frame_id, count_left, count_right);
                                 DVector::from_vec(vec![p_W.x, p_W.y, p_W.z])
                             };
                             (ManifoldType::RN, data)
@@ -724,7 +750,7 @@ impl SlidingWindow {
                 // na::Matrix3::identity() // TODO handle this case properly, maybe return Result or Option
                 continue;
             };
-            let tmp_b = 2.0 * (frame_j.imu_preintegration.as_ref().unwrap().dR.quaternion().inverse() * q_ij).vector();
+            let tmp_b = 2.0 * (frame_j.imu_preintegration.as_ref().unwrap().delta_R.quaternion().inverse() * q_ij).vector();
 
             a += tmp_a.transpose() * tmp_a;
             b += tmp_a.transpose() * tmp_b;
@@ -766,8 +792,8 @@ impl SlidingWindow {
 
             let dt = frame_j.imu_preintegration.as_ref().unwrap().dt;
 
-            let dp = &frame_j.imu_preintegration.as_ref().unwrap().dp;
-            let dv = &frame_j.imu_preintegration.as_ref().unwrap().dv;
+            let dp = &frame_j.imu_preintegration.as_ref().unwrap().delta_p;
+            let dv = &frame_j.imu_preintegration.as_ref().unwrap().delta_v;
 
             let I = na::Matrix3::<f64>::identity();
             let ti = frame_i.state.T_W_B.fixed_view::<3, 1>(0, 3);
@@ -812,7 +838,7 @@ impl SlidingWindow {
 
         let g = solution.fixed_rows::<3>(n_states - 4).into_owned();
         log::debug!("[Linear Alignment] Result g: {:?}, {:?}", g.norm(), g.transpose());
-        let g_prior = na::Vector3::<f64>::new(0.0, 0.0, -9.81);
+        let g_prior = na::Vector3::<f64>::new(0.0, 0.0, 9.81007);
         if (g.norm() - g_prior.norm()).abs() > 0.5 || s < 0.7 || s > 1.3 {
             log::warn!("[Linear Alignment] Linear alignment result is invalid. g.norm(): {:.6}, g_prior.norm(): {:.6}, scale factor: {:.6}", g.norm(), g_prior.norm(), s);
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "Linear alignment result is invalid. Need more motion"));
@@ -852,8 +878,8 @@ impl SlidingWindow {
                 let mut tmp_b = na::DVector::<f64>::zeros(6);
 
                 let dt = frame_j.imu_preintegration.as_ref().unwrap().dt;
-                let dp = &frame_j.imu_preintegration.as_ref().unwrap().dp;
-                let dv = &frame_j.imu_preintegration.as_ref().unwrap().dv;
+                let dp = &frame_j.imu_preintegration.as_ref().unwrap().delta_p;
+                let dv = &frame_j.imu_preintegration.as_ref().unwrap().delta_v;
 
                 let I = na::Matrix3::<f64>::identity();
                 let ti = frame_i.state.T_W_B.fixed_view::<3, 1>(0, 3);
@@ -912,6 +938,33 @@ impl SlidingWindow {
         bc.column_mut(0).copy_from(b.as_ref());
         bc.column_mut(1).copy_from(&c);
         bc
+    }
+
+    fn triangulate_stereo(&self, left_feat: &Feature, T_Cl_B: &na::Matrix4<f64>, right_feat: &Feature, T_Cr_B: &na::Matrix4<f64>) -> Option<na::Vector3<f64>> {
+        // Build DLT system A * X = 0 (4x4), solve via SVD
+        // Each observation contributes 2 rows:  x*(P[2]) - P[0],  y*(P[2]) - P[1]
+        let p_l = T_Cl_B.fixed_view::<3, 4>(0, 0);
+        let p_r = T_Cr_B.fixed_view::<3, 4>(0, 0);
+
+        let mut a = na::Matrix4::<f64>::zeros();
+        a.row_mut(0).copy_from(&((left_feat.undistorted_coord[0] as f64) * p_l.row(2) - p_l.row(0)));
+        a.row_mut(1).copy_from(&((left_feat.undistorted_coord[1] as f64) * p_l.row(2) - p_l.row(1)));
+        a.row_mut(2).copy_from(&((right_feat.undistorted_coord[0] as f64) * p_r.row(2) - p_r.row(0)));
+        a.row_mut(3).copy_from(&((right_feat.undistorted_coord[1] as f64) * p_r.row(2) - p_r.row(1)));
+
+        let svd = na::SVD::new(a, false, true);
+        let v = svd.v_t?.transpose();
+        let x: na::Vector4<f64> = v.column(3).into();
+        
+        if x.w.abs() < 1e-10 { return None; }
+
+        let sign = x.w.signum(); // ensure consistent sign
+        let depth_l = sign * p_l.row(2).transpose().dot(&x);
+        let depth_r = sign * p_r.row(2).transpose().dot(&x);
+
+        if depth_l <= 0.0 || depth_r <= 0.0 { return None; }
+
+        Some(na::Point3::from(x.xyz() / x.w).coords)
     }
 }
 

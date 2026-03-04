@@ -4,7 +4,7 @@ mod tests {
     use nalgebra as na;
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
-    use crate::{datasets::ImuData, imu::{self, piecewise_integration::{ImuPiecewiseIntegration, PreInt}}};
+    use crate::{datasets::ImuData, imu::piecewise_integration::{ImuPiecewiseIntegration, PreInt}};
 
     fn assert_vector_near(v1: &na::Vector3<f64>, v2: &na::Vector3<f64>, epsilon: f64) {
         assert!(
@@ -86,6 +86,38 @@ mod tests {
         t1 - t0
     }
 
+    fn propagate_slice(
+        integrator: &mut ImuPiecewiseIntegration,
+        imu_slice: &[ImuData],
+        bias_a: &na::Vector3<f64>,
+        bias_g: &na::Vector3<f64>,
+    ) -> PreInt {
+        if imu_slice.is_empty() {
+            return PreInt::identity();
+        }
+
+        let mut preint = PreInt::identity();
+        preint.linearized_ba = *bias_a;
+        preint.linearized_bg = *bias_g;
+
+        let mut prev_ts = imu_slice[0].timestamp as f64 * 1e-9;
+
+        for imu in imu_slice.iter() {
+            let ts = imu.timestamp as f64 * 1e-9;
+            let dt = ts - prev_ts;
+            prev_ts = ts;
+
+            if dt <= 0.0 {
+                continue;
+            }
+
+            preint.dt += dt;
+            integrator.propagate(&mut preint, dt, &imu.accel, &imu.gyro, bias_a, bias_g);
+        }
+
+        preint
+    }
+
     // Reference implementation following the paper’s definitions of Eq. (33),
     // using the same “recursive” accumulation but kept separate from your production code.
     fn reference_preint(
@@ -95,7 +127,7 @@ mod tests {
     ) -> (SO3, na::Vector3<f64>, na::Vector3<f64>) {
         let mut prev_ts = imu_slice[0].timestamp as f64 * 1e-9;
 
-        let mut dR = SO3::identity();
+        let mut d_r = SO3::identity();
         let mut dv = na::Vector3::zeros();
         let mut dp = na::Vector3::zeros();
 
@@ -109,16 +141,16 @@ mod tests {
             let acc   = imu.accel - bias_a;
 
             let dphi = omega * dt;
-            let dR_kkp1 = SO3::from_scaled_axis(dphi);
+            let d_r_kkp1 = SO3::from_scaled_axis(dphi);
 
             let dv_prev = dv;
-            dv += dR.rotation_matrix() * acc * dt;
-            dp += dv_prev * dt + 0.5 * dR.rotation_matrix() * acc * dt * dt;
+            dv += d_r.rotation_matrix() * acc * dt;
+            dp += dv_prev * dt + 0.5 * d_r.rotation_matrix() * acc * dt * dt;
 
-            dR = SO3::from_quaternion(dR.quaternion() * dR_kkp1.quaternion());
+            d_r = SO3::from_quaternion(d_r.quaternion() * d_r_kkp1.quaternion());
         }
 
-        (dR, dv, dp)
+        (d_r, dv, dp)
     }
 
     #[test]
@@ -131,15 +163,15 @@ mod tests {
 
         let mut integrator = ImuPiecewiseIntegration::new(/* noise params etc */);
 
-        let out = integrator.propagate(&imu_slice, &bias_a, &bias_g);
-        let (dR_ref, dv_ref, dp_ref) = reference_preint(&imu_slice, &bias_a, &bias_g);
+        let out = propagate_slice(&mut integrator, &imu_slice, &bias_a, &bias_g);
+        let (d_r_ref, dv_ref, dp_ref) = reference_preint(&imu_slice, &bias_a, &bias_g);
 
         // Rotation: compare on tangent spacee
-        let dphi = dR_ref.inverse(None).compose(&out.dR, None, None).log(None); // implement log()->Vector3
+        let dphi = d_r_ref.inverse(None).compose(&out.delta_R, None, None).log(None); // implement log()->Vector3
         assert!(dphi.coeffs().norm() < 1e-10);
         
-        assert!((out.dv - dv_ref).norm() < 1e-10);
-        assert!((out.dp - dp_ref).norm() < 1e-10);
+        assert!((out.delta_v - dv_ref).norm() < 1e-10);
+        assert!((out.delta_p - dp_ref).norm() < 1e-10);
 
         // Time bookkeeping
         let dt_true = elapsed_time(&imu_slice);
@@ -156,24 +188,24 @@ mod tests {
 
         let mut integrator = ImuPiecewiseIntegration::new();
 
-        let base = integrator.propagate(&imu_slice, &bias_a, &bias_g);
+        let base = propagate_slice(&mut integrator, &imu_slice, &bias_a, &bias_g);
 
         for axis in 0..3 {
             let mut bias_a2 = bias_a;
             bias_a2[axis] += eps;
 
-            let out2 = integrator.propagate(&imu_slice, &bias_a2, &bias_g);
+            let out2 = propagate_slice(&mut integrator, &imu_slice, &bias_a2, &bias_g);
 
-            let fd_dv = (out2.dv - base.dv) / eps;
-            let Jv_ba = base.jacobian.fixed_view::<3, 3>(3, 9);
-            let col = Jv_ba.column(axis);
+            let fd_dv = (out2.delta_v - base.delta_v) / eps;
+            let jv_ba = base.jacobian.fixed_view::<3, 3>(3, 9);
+            let col = jv_ba.column(axis);
 
             println!("Finite difference dv wrt bias_a[{}]: {:?}", axis, fd_dv);
             assert!((fd_dv - col).norm() < 1e-4, "Jv_ba col {} mismatch", axis);
 
-            let fd_dp = (out2.dp - base.dp) / eps;
-            let Jp_ba = base.jacobian.fixed_view::<3, 3>(6, 9);
-            let colp = Jp_ba.column(axis);
+            let fd_dp = (out2.delta_p - base.delta_p) / eps;
+            let jp_ba = base.jacobian.fixed_view::<3, 3>(6, 9);
+            let colp = jp_ba.column(axis);
             assert!((fd_dp - colp).norm() < 1e-4, "Jp_ba col {} mismatch", axis);
         }
 
@@ -181,18 +213,18 @@ mod tests {
             let mut bias_g2 = bias_g;
             bias_g2[axis] += eps;
 
-            let out2 = integrator.propagate(&imu_slice, &bias_a, &bias_g2);
+            let out2 = propagate_slice(&mut integrator, &imu_slice, &bias_a, &bias_g2);
 
-            let fd_dv = (out2.dv - base.dv) / eps;
-            let Jv_bg = base.jacobian.fixed_view::<3, 3>(3, 12);
-            let col = Jv_bg.column(axis);
+            let fd_dv = (out2.delta_v - base.delta_v) / eps;
+            let jv_bg = base.jacobian.fixed_view::<3, 3>(3, 12);
+            let col = jv_bg.column(axis);
 
             println!("Finite difference dv wrt bias_g[{}]: {:?}", axis, fd_dv);
             assert!((fd_dv - col).norm() < 1e-4, "Jv_bg col {} mismatch", axis);
 
-            let fd_dp = (out2.dp - base.dp) / eps;
-            let Jp_bg = base.jacobian.fixed_view::<3, 3>(6, 12);
-            let colp = Jp_bg.column(axis);
+            let fd_dp = (out2.delta_p - base.delta_p) / eps;
+            let jp_bg = base.jacobian.fixed_view::<3, 3>(6, 12);
+            let colp = jp_bg.column(axis);
             assert!((fd_dp - colp).norm() < 1e-4, "Jp_bg col {} mismatch", axis);
         }
     }

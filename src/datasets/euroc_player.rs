@@ -410,15 +410,12 @@ impl EurocPlayer {
         }
         
         // Get IMU data if VIO mode
-        let imu_result = if context.processed_frames > 0 { // TODO when implementing IMU data loading
+        let imu_result =  
             Some(Self::get_imu_data_between_frames(
                 imu_data,
                 context.previous_frame_timestamp,
                 image_data[context.current_idx].timestamp,
-            ))
-        } else {
-            None
-        };
+            ));
         
         // Process frame
         let imu_slice = imu_result.as_ref().map(|v| v.as_slice());
