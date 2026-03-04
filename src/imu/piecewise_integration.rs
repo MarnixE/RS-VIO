@@ -136,6 +136,44 @@ pub struct ImuPiecewiseIntegration {
     continious_noise: Matrix12,
 }
 
+pub enum ImuPipeline {
+    Enabled(ImuPiecewiseIntegration),
+    Disabled,
+}
+
+impl ImuPipeline {
+    pub fn from_config(config: Option<config::ImuConfig>) -> Self {
+        match config {
+            Some(cfg) => Self::Enabled(ImuPiecewiseIntegration::from_config(cfg)),
+            None => Self::Disabled,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled(_))
+    }
+
+    pub fn process_imu(&mut self, imu_slice: &[ImuData], current_frame: &mut Frame) -> bool {
+        match self {
+            Self::Enabled(integrator) => integrator.process_imu(imu_slice, current_frame),
+            Self::Disabled => false,
+        }
+    }
+
+    pub fn repropagate(&mut self, new_bias_a: &Vector3, new_bias_g: &Vector3) -> Option<PreInt> {
+        match self {
+            Self::Enabled(integrator) => Some(integrator.repropagate(new_bias_a, new_bias_g)),
+            Self::Disabled => None,
+        }
+    }
+
+    pub fn set_gravity(&mut self, gravity: na::Vector3<f64>) {
+        if let Self::Enabled(integrator) = self {
+            integrator.gravity = gravity;
+        }
+    }
+}
+
 #[allow(non_snake_case)]
 impl ImuPiecewiseIntegration {
     pub fn new() -> Self {
@@ -168,15 +206,15 @@ impl ImuPiecewiseIntegration {
     }
 
     #[allow(non_snake_case)]
-    pub fn process_imu(&mut self, imu_slice: &[ImuData], current_frame: &mut Frame) {
+    pub fn process_imu(&mut self, imu_slice: &[ImuData], current_frame: &mut Frame) -> bool {
         if (imu_slice.is_empty()) {
             log::warn!("No IMU data to propagate");
-            return;
+            return false;
         }
         let total_ts = (imu_slice.last().unwrap().timestamp - imu_slice.first().unwrap().timestamp) as f64 * 1e-9;
         if total_ts >= 5.0 {
             log::warn!("Large time gap in IMU data: {} seconds", total_ts);
-            return;
+            return false;
         }
 
         self.imu_buffer = imu_slice.to_vec(); // Store the IMU data for repropagation
@@ -190,6 +228,7 @@ impl ImuPiecewiseIntegration {
         let bias_g = state.gyro_bias; // linearlized gyro bias (assume constant during preintegration)
 
         let mut prev_ts = imu_slice.first().map_or(0.0, |imu| imu.timestamp as f64 * 1e-9);
+        let t_wb_start = t_wb.clone(); // Store initial translation for sanity check after propagation
 
         // Initialize preintegration variables
         let mut preint = PreInt::identity();
@@ -201,7 +240,6 @@ impl ImuPiecewiseIntegration {
 
         self.continious_noise = self.compute_noise();
 
-        // For simplicity, we can call propagate here, but in a real implementation we might want to batch process or handle this differently
         for (i, imu) in imu_slice.iter().enumerate().skip(1) {
             let ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
             let dt = ts - prev_ts;
@@ -230,10 +268,11 @@ impl ImuPiecewiseIntegration {
             prev_ts = ts;
         }
 
-        print!("Translation norm after IMU propagation: {}\n", t_wb.norm());
-        if t_wb.norm() > 10.0 {
-            log::warn!("Large translation after IMU propagation: t_wb = {:?}", t_wb);
-            return;
+        let t_wb_step = t_wb - t_wb_start;
+        print!("Translation step norm after IMU propagation: {}\n", t_wb_step.norm());
+        if t_wb_step.norm() > 10.0 {
+            log::warn!("Large translation after IMU propagation: t_wb = {:?}", t_wb_step);
+            return false;
         }
         
         // Update the state
@@ -241,9 +280,10 @@ impl ImuPiecewiseIntegration {
         T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&R_wb);
         T_W_B.fixed_view_mut::<3, 1>(0, 3).copy_from(&t_wb);
 
-        current_frame.state.T_W_B = T_W_B.try_into().expect("Failed to convert T_W_B to Matrix4x4");
-        current_frame.state.velocity = v;
+        // current_frame.state.T_W_B = T_W_B.try_into().expect("Failed to convert T_W_B to Matrix4x4");
+        // current_frame.state.velocity = v;
         current_frame.imu_preintegration = Some(preint);
+        true
     }
 
     #[allow(non_snake_case)]
@@ -251,12 +291,10 @@ impl ImuPiecewiseIntegration {
     pub fn propagate(&mut self, preint: &mut PreInt, dt: f64, acc_0: &Vector3, gyr_0: &Vector3, 
             bias_a_linearized: &Vector3, bias_g_linearized: &Vector3) {
         let acc_unbiased = acc_0 - bias_a_linearized; // Bias-corrected acceleration
-        let omega_unbiased = gyr_0 - bias_g_linearized; // Bias-corrected
+        let omega_unbiased = gyr_0 - bias_g_linearized; // Bias-corrected angular velocity
 
         let dphi = omega_unbiased  * dt; // Angular increment
-        let axis = na::Unit::new_normalize(dphi);
-        let angle = dphi.norm();
-        let dR_kkp1 = SO3::from_quaternion(na::UnitQuaternion::from_axis_angle(&axis, angle));
+        let dR_kkp1 = SO3::from_quaternion(na::UnitQuaternion::from_scaled_axis(dphi));
         let J_r = self.right_jacobian_so3(&dphi);
 
         // let dv_ikm1 = preint.delta_v; // Cache delta_v_i_k before updating it for the next iteration
@@ -287,7 +325,8 @@ impl ImuPiecewiseIntegration {
         for (i, imu) in imu_slice.iter().enumerate().skip(1) {
             let ts = imu.timestamp as f64 * 1e-9; // Convert nanoseconds to seconds
             let dt = ts - prev_ts;
-            preint.dt += dt; 
+            preint.dt += dt;
+
             if dt <= 0.0 {
                 log::warn!("Non-positive time interval between IMU measurements: dt = {}", dt);
                 continue;
@@ -307,9 +346,9 @@ impl ImuPiecewiseIntegration {
             prev_ts = ts;
         }
         preint
-        // self.propagate(&imu_slice, preint, &Some(new_bias_a.clone()), &Some(new_bias_g.clone()))
     }
 
+    #[inline]
     fn right_jacobian_so3(&self, phi: &na::Vector3<f64>) -> na::Matrix3<f64> {
         let a = phi.norm();
         let phi_hat = skew_symmetric(phi);

@@ -280,7 +280,7 @@ impl TUMVIPlayer {
         }
         
         // Get IMU data if VIO mode
-        let imu_data = if false && context.processed_frames > 0 { // TODO when implementing IMU data loading
+        let imu_data = if estimator.config.enable_imu && context.processed_frames > 0 { // TODO when implementing IMU data loading
             Some(Self::get_imu_data_between_frames(
                 context.previous_frame_timestamp,
                 image_data[context.current_idx].timestamp,

@@ -3,7 +3,7 @@ use crate::datasets::config::{Config, ImuConfig};
 use crate::estimator::Frame;
 use crate::feature_tracker::StereoPatchTracker;
 use crate::imu;
-use crate::imu::piecewise_integration::{self, ImuPiecewiseIntegration, PreInt};
+use crate::imu::piecewise_integration::{self, ImuPipeline, PreInt};
 use crate::types::{Matrix4x4, UnitQuaternion, Vector3};
 use crate::viewers::Viewer;
 use camera_intrinsic_model::GenericModel;
@@ -44,7 +44,7 @@ pub struct Estimator<'a> {
     // Full trajectory of keyframes
     trajectory: Vec<Matrix4x4>,
     // IMU piecewise integration module
-    piecewise_integration: ImuPiecewiseIntegration,
+    piecewise_integration: ImuPipeline,
     // Velocities
     velocities: Vec<Vector3>,
     angular_velocities: Vec<Vector3>,
@@ -55,6 +55,7 @@ pub struct Estimator<'a> {
     imu_buffer: Vec<ImuData>, // Buffer to store incoming IMU data for preintegration
     first_frame: bool, // Flag to indicate if the current frame is the first frame (used for initialization)
     first_imu: bool,
+    gravity_initialized: bool, // Flag to indicate if gravity has been initialized from IMU data
 }
 
 impl<'a> Estimator<'a> {
@@ -79,12 +80,7 @@ impl<'a> Estimator<'a> {
         right_cam: Option<CameraModelType>,
         imu_config: Option<ImuConfig>,
     ) -> Self {
-        // let imu_config = imu_config.unwrap();
-        let piecewise_integration = if imu_config.is_some() {
-            ImuPiecewiseIntegration::from_config(imu_config.unwrap())
-        } else {
-            ImuPiecewiseIntegration::new()
-        };
+        let piecewise_integration = ImuPipeline::from_config(imu_config);
         // Use provided cameras or create from config
         let (left_cam, right_cam) = match (left_cam, right_cam) {
             (Some(l), Some(r)) => (l, r),
@@ -124,6 +120,7 @@ impl<'a> Estimator<'a> {
             imu_buffer: Vec::new(),
             first_frame: true,
             first_imu: true,
+            gravity_initialized: false,
         }
     }
 
@@ -200,13 +197,6 @@ impl<'a> Estimator<'a> {
         let remaped = camera_intrinsic_model::remap(&img_l8, &xmap, &ymap);
         remaped.save("remaped0.png").unwrap();
         */
-        log::info!(
-            "[Estimator] Last pose {:?}, Last velocity: {:?}, Last accel bias: {:?}, Last gyro bias: {:?}",
-            self.sliding_window.get_keyframe_poses().last().cloned(),
-            self.sliding_window.get_keyframe_velocities().and_then(|v| v.last().copied()),
-            self.sliding_window.get_keyframe_accel_bias().and_then(|v| v.last().copied()),
-            self.sliding_window.get_keyframe_gyro_bias().and_then(|v| v.last().copied())
-        );
 
         // Create frame (images are not stored, only features will be added)
         let mut current_frame = Frame::from_stereo_images(
@@ -255,7 +245,6 @@ impl<'a> Estimator<'a> {
                         UnitQuaternion::from_matrix(&R_rel).euler_angles().1,
                         UnitQuaternion::from_matrix(&R_rel).euler_angles().2]
                     );
-                    log::debug!("[Estimator] Translation since last keyframe: {:.2?}, Euler angles since last keyframe: {:.2?}", t_rel, e_rel);
 
                     // Check if translation and rotation since last keyframe is large enough to trigger a keyframe
                     let translation_threshold = self.config.keyframe_management.translation_threshold;
@@ -288,24 +277,36 @@ impl<'a> Estimator<'a> {
         if current_frame.is_keyframe {
             let imu_start = Instant::now();
 
+            
             let init_rotation = if self.first_imu && imu_data.is_some() {
-                print!("Imu data for preintegration: {:?}", imu_data.unwrap().len());
-                Some(self.process_first_imu(&imu_data.unwrap()))
+                if imu_data.unwrap().len() < 5 {
+                    log::warn!("[Estimator] Not enough IMU data for initial preintegration (need at least 2 measurements), skipping IMU preintegration for this keyframe.");
+                    None
+                } else {
+                    log::info!("[Estimator] IMU data for preintegration: {:?}", imu_data.unwrap().len());
+                    Some(self.process_first_imu(&imu_data.unwrap()))
+                }
             } else {
                 None
             };
             
 
-            log::error!("IMU buffer size before preintegration: {}", self.imu_buffer.len());
+            log::debug!("IMU buffer size before preintegration: {}", self.imu_buffer.len());
              if init_rotation.is_some() {
                 current_frame.state.T_W_B.fixed_view_mut::<3, 3>(0, 0).copy_from(&init_rotation.unwrap());
                 
             }
-            self.piecewise_integration.process_imu(
-                &self.imu_buffer,
-                &mut current_frame,
-            );
-
+            if !self.imu_buffer.is_empty() {
+                let imu_ok = self.piecewise_integration.process_imu(
+                    &self.imu_buffer,
+                    &mut current_frame,
+                );
+                if !imu_ok {
+                    log::warn!("[Estimator] IMU propagation/preintegration rejected for this keyframe; continuing without fresh IMU preintegration.");
+                }
+            } else {
+                log::debug!("[Estimator] IMU disabled or no IMU data buffered; skipping IMU preintegration for this keyframe.");
+            }
             self.imu_buffer.clear(); // Clear the buffer after preintegration
             
             // current_frame.add_imu(imu_preint);
@@ -315,22 +316,25 @@ impl<'a> Estimator<'a> {
             self.sliding_window.optimize(); // TODO handle error
             optimization_time_ms = optimization_start.elapsed().as_secs_f64() * 1000.0;
             self.view_optimization_results();
-
-            if !self.sliding_window.initialized && self.sliding_window.check_sliding_window_size_for_optimization().is_ok() {
+            
+            
+            if self.sliding_window.check_sliding_window_size_for_optimization().is_ok() && !self.gravity_initialized && self.piecewise_integration.is_enabled() {
+                let initial_alignment_start = Instant::now();
                 self.sliding_window.solve_gyroscope_bias(&mut self.piecewise_integration);
 
                 let result = self.sliding_window.solve_linear_alignment();
 
                 let (g_refined, scale) = if result.is_ok() {
-                    self.sliding_window.initialized = true;
+                    self.gravity_initialized = true;
                     result.unwrap()
                 } else {
                     log::warn!("[Estimator] Linear alignment failed: {:?}. Using default gravity and scale.", result.err());
                     (na::Vector3::<f64>::new(0.0, 0.0, 9.81007), 1.0)
                 };
 
-                self.piecewise_integration.gravity = g_refined;
-                
+                self.piecewise_integration.set_gravity(g_refined);
+                let initial_alignment_duration_ms = initial_alignment_start.elapsed().as_secs_f64() * 1000.0;
+                log::debug!("[Timing] initial_alignment={:.3} ms", initial_alignment_duration_ms);
                 self.sliding_window.update_gravity(g_refined);
             }
         }

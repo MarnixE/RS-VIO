@@ -8,6 +8,12 @@ pub struct Config {
     #[serde(rename = "feature_detection")]
     pub feature_detection: FeatureDetectionConfig,
     pub optimization: OptimizationConfig,
+    #[serde(default = "default_enable_imu")]
+    pub enable_imu: bool,
+}
+
+fn default_enable_imu() -> bool {
+    true
 }
 
 

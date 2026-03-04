@@ -36,20 +36,6 @@ impl EurocPlayer {
             }
         };
 
-        let (imu_data, imu_config) = match Self::load_imu_data(
-            &config.dataset_path,
-            &image_data,
-            0, // start_frame_idx
-            image_data.len() - 1, // end_frame_idx
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                result.error_message = format!("Failed to load IMU data: {}", e);
-                return result;
-            }
-        };
-        // let midpoint_integration = midpoint_integration::ImuMidpointIntegration::from_config(&imu_config);
-
         let start_frame_idx = 0;
         let end_frame_idx = image_data.len();
 
@@ -83,12 +69,30 @@ impl EurocPlayer {
             }
         };
 
+        let (imu_data, imu_config) = if cfg.enable_imu {
+            match Self::load_imu_data(
+                &config.dataset_path,
+                &image_data,
+                0,
+                image_data.len() - 1,
+            ) {
+                Ok(data) => (Some(data.0), Some(data.1)),
+                Err(e) => {
+                    result.error_message = format!("Failed to load IMU data: {}", e);
+                    return result;
+                }
+            }
+        } else {
+            log::info!("[EurocPlayer] IMU disabled via config.enable_imu=false");
+            (None, None)
+        };
+
         // Give ownership of the configuration to the estimator and pass a
         // reference to the viewer (which outlives the estimator).
         let mut estimator = {
             let viewer_ref: Option<&mut dyn Viewer> =
                 viewer.as_deref_mut().map(|v| v as &mut dyn Viewer);
-            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam), Some(imu_config))
+            Estimator::new_with_cameras(cfg, viewer_ref, Some(left_cam), Some(right_cam), imu_config)
         };
         Self::initialize_estimator(&mut estimator, &image_data);
 
@@ -119,7 +123,7 @@ impl EurocPlayer {
                     &mut estimator,
                     &mut context,
                     &image_data,
-                    &imu_data,
+                    imu_data.as_deref(),
                     &config.dataset_path,
                 ) {
                     Ok(time) => time,
@@ -393,7 +397,7 @@ impl EurocPlayer {
         estimator: &mut Estimator<'a>,
         context: &mut FrameContext,
         image_data: &[ImageData],
-        imu_data: &[ImuData],
+        imu_data: Option<&[ImuData]>,
         dataset_path: &str,
     ) -> Result<f64> {
         let frame_start = Instant::now();
@@ -410,12 +414,13 @@ impl EurocPlayer {
         }
         
         // Get IMU data if VIO mode
-        let imu_result =  
-            Some(Self::get_imu_data_between_frames(
-                imu_data,
+        let imu_result = imu_data.map(|data| {
+            Self::get_imu_data_between_frames(
+                data,
                 context.previous_frame_timestamp,
                 image_data[context.current_idx].timestamp,
-            ));
+            )
+        });
         
         // Process frame
         let imu_slice = imu_result.as_ref().map(|v| v.as_slice());

@@ -1,6 +1,9 @@
 %YAML:1.0
 ---
 
+# Global runtime options
+enable_imu: false
+
 # Camera Parameters (EuRoC dataset specific)
 # Image dimensions and processing parameters
 camera:

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use nalgebra as na;
 use na::{DVector, UnitQuaternion};
 use crate::datasets::CameraModelType;
-use crate::imu::piecewise_integration::ImuPiecewiseIntegration;
+use crate::imu::piecewise_integration::ImuPipeline;
 use crate::optimization::factors::{BundleAdjustmentFactor, PnPFactor, ImuFactor};
 use crate::optimization::observer::TerminalObserver;
 use crate::estimator::Frame;
@@ -34,8 +34,8 @@ pub struct SlidingWindow {
     /// Map points stored by feature ID: HashMap<feature_id, [x, y, z]>
     pub map_points: HashMap<usize, [f32; 3]>,
 
-    /// Initialized flag to indicate if the sliding window has been initialized with enough keyframes for optimization
-    pub initialized: bool,
+    /// Flag to indicate if the sliding window is using IMU with enough keyframes for optimization
+    pub use_imu: bool,
 
 }
 
@@ -50,7 +50,7 @@ impl SlidingWindow {
             max_frames,
             keyframes: VecDeque::with_capacity(max_frames),
             map_points: HashMap::new(),
-            initialized: false,
+            use_imu: false,
         }
     }
 
@@ -286,7 +286,11 @@ impl SlidingWindow {
         } else {
             500.0 // Default fallback value
         };
-        let sqrt_info = na::Matrix2::identity() * focal_length / 1.5;
+        let sqrt_info = if self.use_imu {
+            na::Matrix2::identity() * focal_length / 1.5
+        } else {
+            na::Matrix2::identity()
+        };
 
         // Add factors
         for (id_frame, frame) in self.keyframes.iter().enumerate() {
@@ -309,9 +313,6 @@ impl SlidingWindow {
                 frame.state.accel_bias.x, frame.state.accel_bias.y, frame.state.accel_bias.z,
                 frame.state.gyro_bias.x, frame.state.gyro_bias.y, frame.state.gyro_bias.z,
             ]);
-
-            let vb_var = format!("vb_{}", id_frame);
-            initial_values.insert(vb_var.clone(), (ManifoldType::RN, v_bias.cast::<f64>()));
             
             // Process features from both cameras
             let camera_features = [
@@ -324,7 +325,14 @@ impl SlidingWindow {
                 .map(|f| (f.feature_id, f))
                 .collect();
             
-            if id_frame > 0 && frame.imu_preintegration.is_some() && self.initialized && frame.imu_preintegration.clone().unwrap().dt < 5.0 {
+            if id_frame > 0 && frame.imu_preintegration.is_some() && self.use_imu && frame.imu_preintegration.clone().unwrap().dt < 5.0 {
+                panic!("IMU should be disabled!");
+                let vb_var = format!("vb_{}", id_frame);
+                let vb_var_prev = format!("vb_{}", id_frame - 1);
+                let kf_var_prev = format!("KF_{}", id_frame - 1);
+                
+                initial_values.insert(vb_var.clone(), (ManifoldType::RN, v_bias.cast::<f64>()));
+
                 let imu_factor = ImuFactor::new(
                     frame.imu_preintegration.as_ref().unwrap().clone(),
                     frame.imu_preintegration.as_ref().unwrap().linearized_ba.clone(),
@@ -332,17 +340,21 @@ impl SlidingWindow {
                 );
                 
                 let var_names: Vec<&str> = vec![
-                    &prev_kf_var, // Previous keyframe pose
-                    &prev_vb_var, // Previous keyframe velocity and biases
+                    &kf_var_prev, // Previous keyframe pose
+                    &vb_var_prev, // Previous keyframe velocity and biases
                     &kf_var,     // Current keyframe pose
                     &vb_var,     // Current keyframe velocity and biases
                 ];
                 let huber_loss = HuberLoss::new(2.0).unwrap();
                 problem.add_residual_block(&var_names, 
                     Box::new(imu_factor), Some(Box::new(huber_loss)));
+            } else if id_frame > 0 && frame.imu_preintegration.is_some() && self.use_imu {
+                log::warn!(
+                    "[SlidingWindow] Skipping IMU factor for frame {} due to long preintegration dt = {:.3}s",
+                    frame.frame_id,
+                    frame.imu_preintegration.as_ref().unwrap().dt
+                );
             };
-            prev_kf_var = kf_var.clone();
-            prev_vb_var = vb_var.clone();
 
             // for left_feat in frame.left_features.iter() {
             //     let Some(right_feat) = right_by_id.get(&left_feat.feature_id) else {
@@ -397,9 +409,6 @@ impl SlidingWindow {
                                     );
                                 
                                 let p_W = R_W_B * p_B  + t_W_B;
-
-                                print!("Triangulated landmark {} at position {:?} from feature {} in frame {}, observed {} times in left cam and {} times in right cam", 
-                                    lm_var, p_W, feature_id, frame.frame_id, count_left, count_right);
                                 DVector::from_vec(vec![p_W.x, p_W.y, p_W.z])
                             };
                             (ManifoldType::RN, data)
@@ -524,7 +533,6 @@ impl SlidingWindow {
                 | apex_solver::optimizer::OptimizationStatus::GradientToleranceReached
                 | apex_solver::optimizer::OptimizationStatus::TrustRegionRadiusTooSmall
                 | apex_solver::optimizer::OptimizationStatus::MinCostThresholdReached
-                | apex_solver::optimizer::OptimizationStatus::MaxIterationsReached
         )
     }
 
@@ -650,7 +658,7 @@ impl SlidingWindow {
         // solver.add_observer(TerminalObserver::new());
 
         // Add variable for the new frame
-        // Only the new frame is optimized and it's initialized from the last keyframe
+        // Only the new frame is optimized and it's use_imu from the last keyframe
         let kf_var = format!("F");
         let T_B_W = self.keyframes.back().unwrap().state.T_W_B.try_inverse().expect("T_W_B should be invertible");
         let t_B_W = T_B_W.fixed_view::<3, 1>(0, 3);
@@ -733,7 +741,7 @@ impl SlidingWindow {
         }
     }
 
-    pub fn solve_gyroscope_bias(&mut self, imu_preintegrator: &mut ImuPiecewiseIntegration) -> Vec<na::Vector3<f64>> {
+    pub fn solve_gyroscope_bias(&mut self, imu_preintegrator: &mut ImuPipeline) {
         let mut a = na::Matrix3::zeros();
         let mut b = na::Vector3::zeros();
 
@@ -755,7 +763,21 @@ impl SlidingWindow {
             a += tmp_a.transpose() * tmp_a;
             b += tmp_a.transpose() * tmp_b;
         }
-        let delta_bg = a.cholesky().expect("Matrix A should be positive definite").solve(&b);
+        let delta_bg = match a.cholesky() {
+            Some(chol) => {
+                let solved = chol.solve(&b);
+                if solved.iter().all(|x| x.is_finite()) {
+                    solved
+                } else {
+                    log::warn!("[SlidingWindow] Gyro bias solve produced non-finite values; keeping previous gyro biases");
+                    return;
+                }
+            }
+            None => {
+                log::warn!("[SlidingWindow] Gyro bias solve failed (A not SPD); keeping previous gyro biases");
+                return;
+            }
+        };
 
         let mut bgs = Vec::new();
         let mut bga = Vec::new();
@@ -771,16 +793,13 @@ impl SlidingWindow {
             let preint = imu_preintegrator.repropagate(
                 &bga[id], 
                 &bgs[id]);
+            if let Some(preint) = preint {
                 frame.imu_preintegration = Some(preint);
+            }
         }
-        bgs
     }
 
     pub fn solve_linear_alignment(&self,) -> Result<(na::Vector3<f64>, f64), std::io::Error> {
-        // This function would implement a linear method to solve for the initial alignment between the visual and inertial estimates
-        // For example, it could use the method of Horn (1987) to find the best-fitting rotation and translation that aligns the visual odometry trajectory with the IMU preintegrated trajectory
-        // The function would return the estimated transformation and a measure of the alignment error (e.g., RMSE)
-
         let n_frames = self.keyframes.len();
         let n_states = n_frames * 3 + 3 + 1;
         let mut a = na::DMatrix::<f64>::zeros(n_states, n_states);
@@ -832,7 +851,21 @@ impl SlidingWindow {
 
         a *= 1000.0;
         b *= 1000.0;
-        let mut solution = a.cholesky().expect("Matrix A should be positive definite").solve(&b);
+        let mut solution = match a.cholesky() {
+            Some(chol) => {
+                let solved = chol.solve(&b);
+                if solved.iter().all(|x| x.is_finite()) {
+                    solved
+                } else {
+                    log::warn!("[Linear Alignment] Solve produced non-finite values");
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "Linear alignment solve produced non-finite values"));
+                }
+            }
+            None => {
+                log::warn!("[Linear Alignment] Solve failed (A not SPD)");
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "Linear alignment solve failed (A not SPD)"));
+            }
+        };
         let s = solution[n_states - 1] / 100.0;
         log::info!("[Linear Alignment] Linear alignment scale factor: {:.6}", s);
 
@@ -860,9 +893,6 @@ impl SlidingWindow {
     }
 
     fn refine_gravity(&self, initial_g: &na::Vector3<f64>, g_prior: na::Vector3<f64>) -> na::Vector3<f64> {
-        // This function would implement a non-linear optimization to refine the gravity vector estimate based on the keyframe poses and IMU preintegrations
-        // It could use a similar approach to the gyroscope bias estimation, but with a more complex cost function that measures how well the gravity vector explains the observed accelerations in the IMU preintegrations given the keyframe poses
-        // The function would return the refined gravity vector
         let n_frames = self.keyframes.len();
         let n_states = n_frames * 3 + 2 + 1;
         let mut a = na::DMatrix::<f64>::zeros(n_states, n_states);
@@ -917,13 +947,26 @@ impl SlidingWindow {
             };
             a *= 1000.0;
             b *= 1000.0;
-            let solution = a.clone().cholesky().expect("Matrix A should be positive definite").solve(&b);
+            let solution = match a.clone().cholesky() {
+                Some(chol) => {
+                    let solved = chol.solve(&b);
+                    if solved.iter().all(|x| x.is_finite()) {
+                        solved
+                    } else {
+                        log::warn!("[Gravity Refinement] Solve produced non-finite values at iteration {}; keeping previous gravity", j);
+                        break;
+                    }
+                }
+                None => {
+                    log::warn!("[Gravity Refinement] Solve failed (A not SPD) at iteration {}; keeping previous gravity", j);
+                    break;
+                }
+            };
             let dg = solution.fixed_rows::<2>(n_states - 3);
             g = (g + lxly * dg).normalize() * g_prior.norm();
         };
-        
 
-        g // Placeholder, implement actual gravity refinement logic here
+        g
     }
 
     fn tangent_basis(&self, g0: &na::Vector3<f64>) -> na::Matrix3x2<f64> {
