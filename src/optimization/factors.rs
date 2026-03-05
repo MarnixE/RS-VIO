@@ -107,7 +107,6 @@ impl Factor for PinholeProjectionFactor {
         // Transform 3D point from world to camera frame
         let R_C_W = self.T_C_W.fixed_view::<3, 3>(0, 0);
         let t_C_W = self.T_C_W.fixed_view::<3, 1>(0, 3);
-        //println!("t_C_W: {:?}", t_C_W.to_owned().to_string());
         let point_camera = R_C_W * point_world + t_C_W;
 
         // Project to normalized coordinates (simple pinhole: x/z, y/z)
@@ -238,7 +237,6 @@ impl Factor for BundleAdjustmentFactorTranslationOnly {
         // Transform 3D point from world to camera frame
         let R_C_B: nalgebra::Matrix<f64, nalgebra::Const<3>, nalgebra::Const<3>, nalgebra::ViewStorage<'_, f64, nalgebra::Const<3>, nalgebra::Const<3>, nalgebra::Const<1>, nalgebra::Const<4>>> = self.T_C_B.fixed_view::<3, 3>(0, 0);
         let t_C_B = self.T_C_B.fixed_view::<3, 1>(0, 3);
-        //println!("t_C_W: {:?}", t_C_W.to_owned().to_string());
         let p_C = R_C_B * (p_W + t_B_W) + t_C_B;
 
         // Project to normalized coordinates (simple pinhole: x/z, y/z)
@@ -267,8 +265,6 @@ impl Factor for BundleAdjustmentFactorTranslationOnly {
         } else {
             None
         };
-        // log::warn!("Residuals BA factor: {:?}", residuals);
-        // log::warn!("Jacobian BA factor: {:?}", jacobian_matrix);
         (residuals, jacobian_matrix)
     }
 
@@ -394,11 +390,9 @@ impl Factor for BundleAdjustmentFactor {
         let p_B = R_B_W * p_W + t_B_W;
         let p_C = R_C_B * p_B + t_C_B;
 
-        //println!("p_C: {:?}", p_C.to_owned().to_string());
         // Check cheirality of the 3D point
         // TODO fix this because it does not help
         if p_C.z <= 0.0 {
-            // log::warn!("3D point is behind the camera, skipping optimization");
             let residuals = DVector::from_vec(vec![
                 1e6, 1e6]);
             if self.fixed_pose.is_some() {
@@ -594,8 +588,6 @@ impl Factor for PnPFactor {
         } else {
             None
         };
-        // log::error!("Residuals PnP factor: {:?}", residuals);
-        // log::error!("Jacobian PnP factor: {:?}", jacobian_matrix);
         (residuals, jacobian_matrix)
     }
 
@@ -790,7 +782,7 @@ impl Factor for ImuFactor {
             J.fixed_view_mut::<3,3>(idx_r, idx_bg).copy_from(&(d_rR_d_bg));
 
             // === Velocity rows [3..6) ===
-            let d_rv_d_phi_i = skew_symmetric(&(RiT * a_v)); // (Ri^T a_v)^wedge  [file:1]
+            let d_rv_d_phi_i = skew_symmetric(&(RiT * a_v)); // (Ri^T a_v)^wedge
             J.fixed_view_mut::<3,3>(idx_v, idx_r).copy_from(&d_rv_d_phi_i); // phi_i
             J.fixed_view_mut::<3,3>(idx_v, idx_v).copy_from(&(-RiT));       // v_i
             J.fixed_view_mut::<3,3>(idx_v, idx_v + 15).copy_from(&RiT);     // v_j
@@ -798,8 +790,7 @@ impl Factor for ImuFactor {
             J.fixed_view_mut::<3,3>(idx_v, idx_bg).copy_from(&(-dv_dbg));   // bg_i
 
             // === Translation rows [6..9) ===
-            // let a_p = t_j - t_i - v_i.clone() * dt + 0.5 * g_w.clone() * dt * dt;
-            let d_rp_d_phi_i = skew_symmetric(&(RiT * a_p)); // (Ri^T a_p)^wedge  [file:1]
+            let d_rp_d_phi_i = skew_symmetric(&(RiT * a_p)); // (Ri^T a_p)^wedge
             J.fixed_view_mut::<3,3>(idx_p, idx_r).copy_from(&d_rp_d_phi_i);          // phi_i
             J.fixed_view_mut::<3,3>(idx_p, idx_v).copy_from(&(-RiT * dt));          // v_i
             J.fixed_view_mut::<3,3>(idx_p, idx_p).copy_from(&(-na::Matrix3::identity()));  // p_i

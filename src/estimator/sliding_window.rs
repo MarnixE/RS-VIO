@@ -186,8 +186,6 @@ impl SlidingWindow {
             .with_cost_tolerance(1e-6)
             .with_parameter_tolerance(1e-9)
             .with_jacobi_scaling(true)
-            .with_damping(1e3)
-            // .with_trust_region(0.2, 0.8, 0.1)
     }
 
     pub fn check_sliding_window_size_for_optimization(&self) -> Result<bool, std::io::Error> {
@@ -225,7 +223,6 @@ impl SlidingWindow {
         let mut problem = Problem::new();
         let mut solver = LevenbergMarquardt::with_config(self.build_solver_config());
         let mut initial_values = HashMap::new();
-        // solver.add_observer(TerminalObserver::new());
         
         // Initialize maps for tracking and counting observations
         let mut map_feature_to_landmark: HashMap<usize, String> = HashMap::new();
@@ -355,17 +352,6 @@ impl SlidingWindow {
                     frame.imu_preintegration.as_ref().unwrap().dt
                 );
             };
-
-            // for left_feat in frame.left_features.iter() {
-            //     let Some(right_feat) = right_by_id.get(&left_feat.feature_id) else {
-            //         continue; // Skip if no corresponding right feature
-            //     };
-            //     if self.map_points.contains_key(&left_feat.feature_id) {
-            //         continue; // Skip if already in map points (will be added as factor later)
-            //     }
-
-            //     if let Some(p_w) =
-            // }
 
             // TODO refactor the loop, quick and dirty check for left cam
             for (i, (features, T_C_B)) in camera_features.iter().enumerate() {
@@ -655,7 +641,6 @@ impl SlidingWindow {
                 .with_jacobi_scaling(false)
         );
         let mut initial_values = HashMap::new();
-        // solver.add_observer(TerminalObserver::new());
 
         // Add variable for the new frame
         // Only the new frame is optimized and it's use_imu from the last keyframe

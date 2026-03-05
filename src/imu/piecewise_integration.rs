@@ -7,7 +7,6 @@ use nalgebra::{self as na, Cholesky, SymmetricEigen};
 use apex_solver::manifold::{LieGroup, so3::SO3};
 use crate::estimator::Frame;
 
-// type Matrix6 = na::SMatrix<f64, 6, 6>;
 type Matrix15 = na::SMatrix<f64, 15, 15>;
 type Matrix12 = na::SMatrix<f64, 12, 12>;
 type Vector12 = na::SVector<f64, 12>;
@@ -123,15 +122,12 @@ impl PreInt {
 }
 
 pub struct ImuPiecewiseIntegration {
-    // Fields for piecewise integration
-    // prev_timestamp: f64,
     T_BS: na::Matrix4<f64>,
     accel_noise_density: f64,
     gyro_noise_density: f64,
     accel_random_walk: f64,
     gyro_random_walk: f64,
     imu_buffer: Vec<ImuData>,
-    // preintegrated_noise: na::SVector<f64, 9>,
     pub gravity: na::Vector3<f64>,
     continious_noise: Matrix12,
 }
@@ -193,7 +189,6 @@ impl ImuPiecewiseIntegration {
 
     pub fn from_config(config: config::ImuConfig) -> Self {
         ImuPiecewiseIntegration {
-            // prev_timestamp: 0.0,
             T_BS: nalgebra::Matrix4::from_row_slice(&config.T_BS.data),
             accel_noise_density: config.accel_noise_density,
             gyro_noise_density: config.gyro_noise_density,

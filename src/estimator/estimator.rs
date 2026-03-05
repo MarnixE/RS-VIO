@@ -308,8 +308,6 @@ impl<'a> Estimator<'a> {
                 log::debug!("[Estimator] IMU disabled or no IMU data buffered; skipping IMU preintegration for this keyframe.");
             }
             self.imu_buffer.clear(); // Clear the buffer after preintegration
-            
-            // current_frame.add_imu(imu_preint);
             imu_time_ms = imu_start.elapsed().as_secs_f64() * 1000.0;
             let optimization_start = Instant::now();
             self.sliding_window.add_frame(current_frame);
@@ -511,7 +509,6 @@ impl<'a> Estimator<'a> {
             
             // Display trajectory as a continuous 3D path
             v.log_trajectory(&self.trajectory, "trajectory/path");
-            // log::info!("[Estimator] System position: {:?}, {:?}, {:?}", mat[0][3], mat[1][3], mat[2][3]);
         }
     }
 }
